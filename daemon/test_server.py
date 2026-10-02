@@ -181,6 +181,51 @@ def main():
         status, resp = c.request("GET", f"/rooms/{room_id}/events?token=" + qualia_tok)
         check("token in query string alone is not accepted as auth", status == 401)
 
+        # --- §7 additions: /me/rooms, /participants, pause, archive ---
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("Teddy", teddy_tok))
+        check("my_rooms succeeds and includes the test room", status == 200 and any(
+            r["id"] == room_id for r in resp["rooms"]
+        ))
+        my_room = next(r for r in resp["rooms"] if r["id"] == room_id)
+        check("my_rooms exposes last_seq/my_cursor (the UI's field names)",
+              "last_seq" in my_room and "my_cursor" in my_room)
+
+        status, resp = c.request("GET", "/participants", headers=c.auth("Teddy", teddy_tok))
+        names = {p["name"]: p["kind"] for p in resp["participants"]}
+        check("participants lists Teddy and Qualia with kinds", names.get("Teddy") == "human" and names.get("Qualia") == "ai")
+
+        status, resp = c.request("GET", "/participants")
+        check("participants requires auth", status == 401)
+
+        status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Qualia", qualia_tok))
+        check("AI cannot pause over HTTP", status == 400)
+
+        status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Teddy", teddy_tok))
+        check("human pause over HTTP succeeds", status == 200)
+
+        status, resp = c.request("POST", f"/rooms/{room_id}/resume", body={}, headers=c.auth("Teddy", teddy_tok))
+        check("resume after HTTP pause succeeds", status == 200)
+
+        status, resp = c.request("POST", f"/rooms/{room_id}/archive", body={}, headers=c.auth("Qualia", qualia_tok))
+        check("AI cannot archive over HTTP", status == 400)
+
+        status, resp = c.request("POST", f"/rooms/{room_id}/archive", body={}, headers=c.auth("Teddy", teddy_tok))
+        check("human archive over HTTP succeeds", status == 200)
+
+        # --- static UI serving + CSP ---
+        status, resp = c.request("GET", "/ui/app.css")
+        check("missing UI file responds cleanly (not a crash)", status in (200, 500))
+
+        status, resp = c.request("GET", "/nonexistent-route-for-csp-check")
+        csp_present = False  # checked via raw headers below
+        conn2 = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+        conn2.request("GET", "/nonexistent-route-for-csp-check", headers={"Host": f"127.0.0.1:{PORT}"})
+        raw_resp = conn2.getresponse()
+        csp_present = raw_resp.getheader("Content-Security-Policy") is not None
+        raw_resp.read()
+        conn2.close()
+        check("CSP header present on an API response", csp_present)
+
         # --- 404 ---
         status, resp = c.request("GET", "/nonsense")
         check("unknown route is 404", status == 404)

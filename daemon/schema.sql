@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS events (
     author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'ai')),
     type        TEXT NOT NULL CHECK (type IN
                     ('message', 'join', 'leave', 'topic_change',
-                     'pass', 'pause', 'resume')),
+                     'pass', 'pause', 'resume', 'archive')),
     -- Addressing (spec §3.2): NULL = unaddressed, or a JSON array of
     -- participant names (possibly just ["all"]). JSON, not a delimited
     -- string, so a name containing a comma can't corrupt it.

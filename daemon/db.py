@@ -473,6 +473,36 @@ def resume_room(conn, room_id: str, resumed_by: str, token: str,
                       body=f"resumed, hop_limit now {new_limit}")
 
 
+def pause_room(conn, room_id: str, paused_by: str, token: str, reason: str | None = None) -> None:
+    """ui-spec.md §5/§7.3: Teddy can always stop a room, not just the hop
+    cap. Human-only, same shape as resume_room's own guard."""
+    kind = authenticate(conn, paused_by, token)
+    if kind != "human":
+        raise HaikuError("only a human can pause a room")
+    room = _get_room(conn, room_id)
+    if room["state"] == "archived":
+        raise HaikuError("room is archived")
+    if room["state"] == "paused":
+        raise HaikuError("room is already paused")
+    with _transaction(conn):
+        conn.execute("UPDATE rooms SET state = 'paused' WHERE id = ?", (room_id,))
+        _insert_event(conn, room_id, paused_by, "human", "pause", body=reason)
+
+
+def archive_room(conn, room_id: str, archived_by: str, token: str) -> None:
+    """ui-spec.md §5/§7.3: ends a room; stays readable, no further sends.
+    Human-only."""
+    kind = authenticate(conn, archived_by, token)
+    if kind != "human":
+        raise HaikuError("only a human can archive a room")
+    room = _get_room(conn, room_id)
+    if room["state"] == "archived":
+        raise HaikuError("room is already archived")
+    with _transaction(conn):
+        conn.execute("UPDATE rooms SET state = 'archived' WHERE id = ?", (room_id,))
+        _insert_event(conn, room_id, archived_by, kind, "archive")
+
+
 def read_events(conn, room_id: str, participant: str, token: str,
                  since: int | None = None, limit: int | None = None,
                  advance: bool = True, exclude_self: bool = False) -> dict:
@@ -553,6 +583,43 @@ def get_room(conn, room_id: str) -> dict:
     return dict(_get_room(conn, room_id))
 
 
+def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
+    """ui-spec.md §7.1: for the authenticated participant, every room they
+    belong to (not left) with unread, needs_me, state, hop counts and
+    last_event_ts — what the room-list UI needs in one call."""
+    authenticate(conn, participant, token)
+    rows = conn.execute(
+        """SELECT rm.id, rm.name, rm.topic, rm.state, rm.hop_count, rm.hop_limit,
+                  r.owes_reply_to_seq,
+                  COALESCE(c.last_delivered_seq, 0) AS cursor_seq,
+                  (SELECT COALESCE(MAX(seq), 0) FROM events WHERE room_id = rm.id) AS max_seq,
+                  (SELECT MAX(ts) FROM events WHERE room_id = rm.id) AS last_event_ts
+           FROM roster r
+           JOIN rooms rm ON rm.id = r.room_id
+           LEFT JOIN cursors c ON c.room_id = r.room_id AND c.participant = r.participant
+           WHERE r.participant = ? AND r.status != 'left'
+           ORDER BY last_event_ts DESC""",
+        (participant,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["unread"] = max(0, d["max_seq"] - d["cursor_seq"])
+        # Aliases the UI reads (ui-spec.md's own naming): keep both rather
+        # than rename and risk the other callers/tests of max_seq/cursor_seq.
+        d["last_seq"] = d["max_seq"]
+        d["my_cursor"] = d["cursor_seq"]
+        d["needs_me"] = d["state"] == "paused" or d["owes_reply_to_seq"] is not None
+        result.append(d)
+    return result
+
+
+def list_participants(conn) -> list[dict]:
+    """ui-spec.md §7.4: names + kinds only, for the invite picker."""
+    rows = conn.execute("SELECT name, kind FROM participants ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_rooms(conn, state: str | None = None) -> list[dict]:
     if state is not None:
         rows = conn.execute("SELECT * FROM rooms WHERE state = ? ORDER BY created_at", (state,)).fetchall()
@@ -562,9 +629,28 @@ def list_rooms(conn, state: str | None = None) -> list[dict]:
 
 
 def room_roster(conn, room_id: str) -> list[dict]:
+    """Per ui-spec.md §7.2: kind (for the UI's human/AI badge) and
+    last_active_ts (last authored event or last delivery — the daemon
+    cannot know a session is mid-turn, so it offers this instead of a
+    "busy" guess, per the spec's own call). Obligation rows carry who
+    the owed reply is to and when that event happened, not just the seq."""
     rows = conn.execute(
-        """SELECT participant, status, owes_reply_to_seq
-           FROM roster WHERE room_id = ? ORDER BY participant""",
+        """SELECT r.participant, p.kind, r.status, r.owes_reply_to_seq,
+                  (SELECT MAX(ts) FROM events WHERE room_id = r.room_id AND author = r.participant) AS last_authored_ts,
+                  c.updated_at AS cursor_ts,
+                  oe.author AS owes_from_author, oe.ts AS owes_from_ts
+           FROM roster r
+           JOIN participants p ON p.name = r.participant
+           LEFT JOIN cursors c ON c.room_id = r.room_id AND c.participant = r.participant
+           LEFT JOIN events oe ON oe.room_id = r.room_id AND oe.seq = r.owes_reply_to_seq
+           WHERE r.room_id = ? ORDER BY r.participant""",
         (room_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    result = []
+    for row in rows:
+        d = dict(row)
+        last_authored = d.pop("last_authored_ts")
+        cursor_ts = d.pop("cursor_ts")
+        d["last_active_ts"] = max(filter(None, [last_authored, cursor_ts]), default=None)
+        result.append(d)
+    return result

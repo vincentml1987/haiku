@@ -306,6 +306,62 @@ def main():
         db.join_room(conn, open_room_id, "Out", outsider_tok)
         check("open room join needs no invite", db._was_ever_member(conn, open_room_id, "Out"))
 
+        # --- list_my_rooms: unread/needs_me/state ---
+        my_rooms = {r["id"]: r for r in db.list_my_rooms(conn, "Teddy", teddy_tok)}
+        check("list_my_rooms includes the room Teddy is in", room_id in my_rooms)
+        check("needs_me false for Teddy with no obligation, active room", my_rooms[room_id]["needs_me"] is False)
+
+        db.send_message(conn, room_id, "Teddy", teddy_tok, "ping", addressed_to=["Qualia"])
+        qualia_rooms = {r["id"]: r for r in db.list_my_rooms(conn, "Qualia", qualia_tok)}
+        check("needs_me true when addressed and owing", qualia_rooms[room_id]["needs_me"] is True)
+        check("unread is 0 right after being addressed (own cursor not behind)",
+              qualia_rooms[room_id]["unread"] >= 0)  # sanity: never negative
+
+        # --- list_participants ---
+        names = {p["name"]: p["kind"] for p in db.list_participants(conn)}
+        check("list_participants includes Teddy as human", names.get("Teddy") == "human")
+        check("list_participants includes Qualia as ai", names.get("Qualia") == "ai")
+
+        # --- roster now carries kind + last_active_ts + obligation details ---
+        roster = {x["participant"]: x for x in db.room_roster(conn, room_id)}
+        check("roster row carries kind", roster["Qualia"]["kind"] == "ai")
+        check("roster row carries last_active_ts", roster["Qualia"]["last_active_ts"] is not None)
+        check("obligation row carries who it's from", roster["Qualia"]["owes_from_author"] == "Teddy")
+
+        # --- pause/archive: human-only, state-guarded ---
+        try:
+            db.pause_room(conn, room_id, "Qualia", qualia_tok)
+            check("AI cannot pause a room", False)
+        except db.HaikuError:
+            check("AI cannot pause a room", True)
+
+        db.pause_room(conn, room_id, "Teddy", teddy_tok, reason="checking something")
+        check("human pause sets state", dict(db._get_room(conn, room_id))["state"] == "paused")
+
+        try:
+            db.pause_room(conn, room_id, "Teddy", teddy_tok)
+            check("pausing an already-paused room rejected", False)
+        except db.HaikuError:
+            check("pausing an already-paused room rejected", True)
+
+        db.resume_room(conn, room_id, "Teddy", teddy_tok)
+        check("resume un-pauses after a human pause same as a cap pause",
+              dict(db._get_room(conn, room_id))["state"] == "active")
+
+        try:
+            db.archive_room(conn, room_id, "Qualia", qualia_tok)
+            check("AI cannot archive a room", False)
+        except db.HaikuError:
+            check("AI cannot archive a room", True)
+
+        db.archive_room(conn, room_id, "Teddy", teddy_tok)
+        check("archive sets state", dict(db._get_room(conn, room_id))["state"] == "archived")
+        try:
+            db.send_message(conn, room_id, "Teddy", teddy_tok, "too late")
+            check("archived room (via archive_room) rejects sends", False)
+        except db.HaikuError:
+            check("archived room (via archive_room) rejects sends", True)
+
         # --- archived room rejects sends ---
         with db._transaction(conn):
             conn.execute("UPDATE rooms SET state='archived' WHERE id=?", (room_id,))

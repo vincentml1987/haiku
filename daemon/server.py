@@ -208,9 +208,56 @@ def h_ack(conn, params, body, headers, room_id):
     return {"ok": True}
 
 
+@route("GET", r"/me/rooms")
+def h_my_rooms(conn, params, body, headers):
+    participant, token = _auth_headers(headers)
+    return {"rooms": db.list_my_rooms(conn, participant, token)}
+
+
+@route("GET", r"/participants")
+def h_participants(conn, params, body, headers):
+    participant, token = _auth_headers(headers)
+    db.authenticate(conn, participant, token)
+    return {"participants": db.list_participants(conn)}
+
+
+@route("POST", f"/rooms/{ROOM_ID}/pause")
+def h_pause(conn, params, body, headers, room_id):
+    pauser, token = _auth_headers(headers)
+    db.pause_room(conn, room_id, pauser, token, reason=body.get("reason"))
+    return {"ok": True}
+
+
+@route("POST", f"/rooms/{ROOM_ID}/archive")
+def h_archive(conn, params, body, headers, room_id):
+    archiver, token = _auth_headers(headers)
+    db.archive_room(conn, room_id, archiver, token)
+    return {"ok": True}
+
+
 def _host_ok(host_header: str, port: int) -> bool:
     host = (host_header or "").split(":")[0].strip("[]")
     return host in ("127.0.0.1", "localhost", "::1")
+
+
+UI_DIR = Path(__file__).parent / "ui"
+
+# ui-spec.md §1: a FIXED allowlist, never a path-joined directory — no
+# traversal surface. Add a new UI file here deliberately, never by pattern.
+STATIC_FILES = {
+    "/ui": (UI_DIR / "index.html", "text/html; charset=utf-8"),
+    "/ui/": (UI_DIR / "index.html", "text/html; charset=utf-8"),
+    "/ui/app.js": (UI_DIR / "app.js", "application/javascript; charset=utf-8"),
+    "/ui/app.css": (UI_DIR / "app.css", "text/css; charset=utf-8"),
+}
+
+# ui-spec.md §1: no inline script/style, no external fetches, no CDN, no
+# web fonts, no framing. Sent on every UI (and, harmlessly, API) response.
+CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -223,11 +270,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _respond_static(self, path):
+        entry = STATIC_FILES.get(path)
+        if entry is None:
+            return False
+        file_path, content_type = entry
+        try:
+            data = file_path.read_bytes()
+        except OSError:
+            self._respond(500, {"error": "UI file missing"})
+            return True
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
 
     def _read_json_body(self):
         if self.command != "POST":
@@ -258,6 +328,9 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+
+        if method == "GET" and self._respond_static(parsed.path):
+            return
 
         try:
             body = self._read_json_body()
