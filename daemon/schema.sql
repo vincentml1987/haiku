@@ -12,10 +12,15 @@ PRAGMA journal_mode = WAL;
 -- by stable display name (spec §1) — "Teddy", "Qualia - 005 - HAIKU", etc.
 -- `address` is transport-specific (e.g. a cross-session agent ref) and is
 -- the daemon/plugin's business only; it is never shown in a room.
+-- `token_hash` is sha256(plaintext token). The plaintext is returned once,
+-- at registration, and never stored. Every mutating call must present the
+-- matching token — without this, `author` is just a string a caller
+-- supplies, and the hop cap / resume-only-by-human rules mean nothing.
 CREATE TABLE IF NOT EXISTS participants (
     name        TEXT PRIMARY KEY,
     kind        TEXT NOT NULL CHECK (kind IN ('human', 'ai')),
     address     TEXT,
+    token_hash  TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -45,8 +50,9 @@ CREATE TABLE IF NOT EXISTS events (
     type        TEXT NOT NULL CHECK (type IN
                     ('message', 'join', 'leave', 'topic_change',
                      'pass', 'pause', 'resume')),
-    -- Addressing (spec §3.2): NULL = unaddressed, 'all' = @all, or a
-    -- comma-separated list of participant names for @name1,@name2 etc.
+    -- Addressing (spec §3.2): NULL = unaddressed, or a JSON array of
+    -- participant names (possibly just ["all"]). JSON, not a delimited
+    -- string, so a name containing a comma can't corrupt it.
     -- Only meaningful on type = 'message'.
     addressed_to TEXT,
     body        TEXT,  -- message text, new topic, pause/resume reason, etc.
