@@ -133,14 +133,19 @@ def h_create_room(conn, params, body, headers):
 
 @route("GET", r"/rooms")
 def h_list_rooms(conn, params, body, headers):
+    participant, token = _auth_headers(headers)
+    db.authenticate(conn, participant, token)
     state = params.get("state", [None])[0]
-    return {"rooms": db.list_rooms(conn, state=state)}
+    return {"rooms": db.list_rooms(conn, state=state, caller=participant)}
 
 
 @route("GET", f"/rooms/{ROOM_ID}")
 def h_get_room(conn, params, body, headers, room_id):
-    room = db.get_room(conn, room_id)
-    room["roster"] = db.room_roster(conn, room_id)
+    participant, token = _auth_headers(headers)
+    db.authenticate(conn, participant, token)
+    room = db.get_room(conn, room_id, caller=participant)
+    if db.can_see_roster(conn, room_id, participant):
+        room["roster"] = db.room_roster(conn, room_id)
     return room
 
 
@@ -353,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._respond(200, result)
                 except ClientError as e:
                     return self._respond(e.status, {"error": e.message})
+                except db.Forbidden as e:
+                    return self._respond(403, {"error": str(e)})
                 except db.HaikuError as e:
                     return self._respond(400, {"error": str(e)})
                 except KeyError as e:

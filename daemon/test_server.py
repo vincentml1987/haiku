@@ -108,7 +108,9 @@ def main():
         check("wrong Host header rejected", status == 403)
 
         status, resp = c.request("GET", "/rooms", host="127.0.0.1:" + str(PORT))
-        check("correct Host header accepted", status == 200)
+        check("correct Host header accepted (reaches the handler, which wants auth)", status == 401)
+        status, resp = c.request("GET", "/rooms")
+        check("GET /rooms requires auth", status == 401)
 
         # --- Content-Type enforcement on POST ---
         status, resp = c.request("POST", "/register/ai", body={"name": "NoCT"}, content_type=None)
@@ -235,6 +237,35 @@ def main():
         status, resp = c.request("GET", "/me/rooms", headers=c.auth("LobbyCheck", lobby_tok))
         check("invite shows up in /me/rooms pending_invites",
               resp["pending_invites"] == [{"room_id": inv_id, "room_name": "inv-http", "invited_by": "Teddy"}])
+
+        # --- room metadata / roster scoping (Vero's read-only pass, 2026-10-02) ---
+        status, resp = c.request("GET", f"/rooms/{room_id}")
+        check("GET /rooms/{id} requires auth", status == 401)
+        status, resp = c.request("GET", "/rooms", headers=c.auth("Teddy", teddy_tok))
+        check("human sees every room in full over HTTP",
+              status == 200 and {room_id, lobby_id, inv_id} <= {r["id"] for r in resp["rooms"]}
+              and all("created_by" in r for r in resp["rooms"]))
+        status, resp = c.request("GET", "/rooms", headers=c.auth("LobbyCheck", lobby_tok))
+        listed = {r["name"]: r for r in resp["rooms"]}
+        check("non-member AI sees the open lobby (public fields only)",
+              "lobby" in listed and set(listed["lobby"]) == {"id", "name", "topic", "mode", "state"})
+        check("non-member AI does not see a closed room it has no invite to", "testroom" not in listed)
+        check("invitee sees the room it is invited to, public fields only",
+              "inv-http" in listed and set(listed["inv-http"]) == {"id", "name", "topic", "mode", "state"})
+        status, resp = c.request("GET", f"/rooms/{room_id}", headers=c.auth("LobbyCheck", lobby_tok))
+        check("non-member AI gets 403 and no roster for a closed room", status == 403 and "roster" not in resp)
+        status, resp = c.request("GET", f"/rooms/{lobby_id}", headers=c.auth("LobbyCheck", lobby_tok))
+        check("non-member AI sees no roster for an open room",
+              status == 200 and "roster" not in resp and "created_by" not in resp)
+        status, resp = c.request("GET", f"/rooms/{inv_id}", headers=c.auth("LobbyCheck", lobby_tok))
+        check("pending invitee gets public fields, no roster",
+              status == 200 and "roster" not in resp and resp["name"] == "inv-http")
+        status, resp = c.request("GET", f"/rooms/{room_id}", headers=c.auth("Qualia", qualia_tok))
+        check("a member AI still gets the full room with roster", status == 200 and "roster" in resp)
+        status, resp = c.request("GET", f"/rooms/{room_id}", headers=c.auth("Teddy", teddy_tok))
+        check("a human still gets the full room with roster", status == 200 and "roster" in resp)
+        status, resp = c.request("GET", f"/rooms/{room_id}/events", headers=c.auth("LobbyCheck", lobby_tok))
+        check("non-member events read is 403, not 400", status == 403)
 
         status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Qualia", qualia_tok))
         check("AI cannot pause over HTTP", status == 400)

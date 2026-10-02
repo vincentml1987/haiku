@@ -126,6 +126,24 @@ def main():
         except db.HaikuError:
             check("AI member cannot invite", True)
 
+        # Open room: any active member, AI included, may invite anyone registered.
+        open_inv = db.create_room(conn, "open-invites", "Qualia", qualia_tok, mode="open")
+        db.invite(conn, open_inv, "Qualia", qualia_tok, "Vero")
+        check("an AI member can invite an AI into an open room", db._has_invite(conn, open_inv, "Vero"))
+        db.invite(conn, open_inv, "Qualia", qualia_tok, "Teddy")
+        check("an AI member can invite a human into an open room", db._has_invite(conn, open_inv, "Teddy"))
+        try:
+            db.invite(conn, open_inv, "Out", outsider_tok, "Vero")
+            check("a non-member cannot invite, even into an open room", False)
+        except db.Forbidden:
+            check("a non-member cannot invite, even into an open room", True)
+        try:
+            db.invite(conn, room_id, "Qualia", qualia_tok, "Out")
+            check("an AI member still cannot invite into a closed room", False)
+        except db.HaikuError as e:
+            check("an AI member still cannot invite into a closed room (accurate message)",
+                  "closed room" in str(e) and not isinstance(e, db.Forbidden))
+
         db.invite(conn, room_id, "Teddy", teddy_tok, "Vero")
         db.join_room(conn, room_id, "Vero", vero_tok)
 

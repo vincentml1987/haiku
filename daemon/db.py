@@ -203,6 +203,20 @@ class HaikuError(Exception):
     not a stack trace (e.g. room paused, bad credentials, unknown room)."""
 
 
+class Forbidden(HaikuError):
+    """A HaikuError the HTTP layer reports as 403 rather than 400: the
+    caller is who they say they are, but isn't allowed to see/do this
+    (e.g. reading a room they are not a member of)."""
+
+
+def _is_active_member(conn, room_id: str, participant: str) -> bool:
+    row = conn.execute(
+        "SELECT status FROM roster WHERE room_id = ? AND participant = ?",
+        (room_id, participant),
+    ).fetchone()
+    return row is not None and row["status"] != "left"
+
+
 @contextlib.contextmanager
 def _transaction(conn: sqlite3.Connection):
     """Every public op runs inside one BEGIN IMMEDIATE..COMMIT. Single-writer
@@ -323,12 +337,8 @@ def authenticate(conn, name: str, token: str) -> str:
 
 
 def _require_member(conn, room_id: str, participant: str):
-    row = conn.execute(
-        "SELECT status FROM roster WHERE room_id = ? AND participant = ?",
-        (room_id, participant),
-    ).fetchone()
-    if row is None or row["status"] == "left":
-        raise HaikuError(f"{participant} is not a member of this room")
+    if not _is_active_member(conn, room_id, participant):
+        raise Forbidden(f"{participant} is not a member of this room")
 
 
 def create_room(conn, name: str, created_by: str, token: str, topic: str | None = None,
@@ -411,13 +421,15 @@ def _has_invite(conn, room_id: str, participant: str) -> bool:
 
 
 def invite(conn, room_id: str, inviter: str, token: str, invitee: str) -> None:
-    """Spec §1/§2: closed = Teddy admits. v1 rule: in a closed room, only
-    a present human MEMBER can invite (not just any human who knows the
-    room id)."""
+    """Spec §2 (Teddy, 2026-10-02): in an OPEN room any active member, human
+    or AI, may invite any registered participant. In a CLOSED room only a
+    present human MEMBER may invite (not just any human who knows the room
+    id), so a human stays the gate to private logs. Either way an invite
+    is an offer only; the invitee must still join explicitly."""
     kind = authenticate(conn, inviter, token)
-    _get_room(conn, room_id)
+    room = _get_room(conn, room_id)
     _require_member(conn, room_id, inviter)
-    if kind != "human":
+    if room["mode"] == "closed" and kind != "human":
         raise HaikuError("only a human member can invite into a closed room")
     if conn.execute("SELECT 1 FROM participants WHERE name = ?", (invitee,)).fetchone() is None:
         raise HaikuError(f"{invitee} is not a registered participant yet — they must register with the daemon first")
@@ -717,9 +729,37 @@ def set_topic(conn, room_id: str, author: str, token: str, topic: str) -> int:
     return seq
 
 
-def get_room(conn, room_id: str) -> dict:
-    return dict(_get_room(conn, room_id))
+# What a caller who is not (yet) in a room may see of it: just enough to
+# decide whether to join. No creator, no hop state, no roster, no events.
+_PUBLIC_ROOM_FIELDS = ("id", "name", "topic", "mode", "state")
 
+
+def _public_room(room) -> dict:
+    return {k: room[k] for k in _PUBLIC_ROOM_FIELDS}
+
+
+def get_room(conn, room_id: str, caller: str | None = None) -> dict:
+    """Room metadata, scoped by caller (docs/haiku-room-spec.md: rosters
+    are per room, visible to that room's members only). `caller` must
+    already be authenticated. A human admin sees everything. An AI that
+    is an active member sees the full room. A non-member AI sees only the
+    public fields, and only if the room is open or it holds an invite;
+    otherwise Forbidden. The roster is attached by the HTTP layer only
+    when `include_roster(...)` says so."""
+    room = _get_room(conn, room_id)
+    if caller is None:
+        return dict(room)
+    kind = conn.execute("SELECT kind FROM participants WHERE name = ?", (caller,)).fetchone()["kind"]
+    if kind == "human" or _is_active_member(conn, room_id, caller):
+        return dict(room)
+    if room["mode"] == "open" or _has_invite(conn, room_id, caller):
+        return _public_room(room)
+    raise Forbidden("not a member of this room")
+
+
+def can_see_roster(conn, room_id: str, caller: str) -> bool:
+    kind = conn.execute("SELECT kind FROM participants WHERE name = ?", (caller,)).fetchone()["kind"]
+    return kind == "human" or _is_active_member(conn, room_id, caller)
 
 def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
     """ui-spec.md §7.1: for the authenticated participant, every room they
@@ -791,12 +831,27 @@ def list_pending_invites(conn, participant: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def list_rooms(conn, state: str | None = None) -> list[dict]:
+def list_rooms(conn, state: str | None = None, caller: str | None = None) -> list[dict]:
+    """`caller` (already authenticated) scopes the result. A human sees
+    every room in full. An AI sees full rows for rooms it is an active
+    member of, public fields (name/topic/mode/state) for open rooms and
+    rooms it holds an invite to, and nothing about any other closed room."""
     if state is not None:
         rows = conn.execute("SELECT * FROM rooms WHERE state = ? ORDER BY created_at", (state,)).fetchall()
     else:
         rows = conn.execute("SELECT * FROM rooms ORDER BY created_at").fetchall()
-    return [dict(r) for r in rows]
+    if caller is None:
+        return [dict(r) for r in rows]
+    kind = conn.execute("SELECT kind FROM participants WHERE name = ?", (caller,)).fetchone()["kind"]
+    if kind == "human":
+        return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        if _is_active_member(conn, r["id"], caller):
+            out.append(dict(r))
+        elif r["mode"] == "open" or _has_invite(conn, r["id"], caller):
+            out.append(_public_room(r))
+    return out
 
 
 def room_roster(conn, room_id: str) -> list[dict]:
