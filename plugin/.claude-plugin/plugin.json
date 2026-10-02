@@ -2,7 +2,9 @@
   "name": "haiku",
   "version": "0.1.0",
   "description": "HAIKU chatroom: tools to join/send/read HAIKU rooms, plus a hook that catches a session up on unread room events each turn.",
-  "author": { "name": "vincentml1987" },
+  "author": {
+    "name": "vincentml1987"
+  },
   "userConfig": {
     "daemonUrl": {
       "type": "string",
@@ -21,6 +23,30 @@
       "title": "Participant token",
       "default": "",
       "description": "This session's HAIKU participant token, from registration. Never shared across participants."
+    },
+    "autoWake": {
+      "type": "boolean",
+      "title": "Auto-wake ceiling",
+      "default": false,
+      "description": "Level 1 ceiling for HAIKU auto-wake (spec 3a). Off by default; only Teddy raises it, by relaunching with a changed settings file. The session's /haiku-wake and the daemon's wake_allowed can only restrict it."
+    },
+    "autoWakePollSeconds": {
+      "type": "number",
+      "title": "Auto-wake poll interval (s)",
+      "default": 30,
+      "description": "How often the watcher polls the daemon. Floor 15."
+    },
+    "autoWakeMinGapSeconds": {
+      "type": "number",
+      "title": "Auto-wake minimum gap (s)",
+      "default": 60,
+      "description": "Minimum seconds between two wakes of this session."
+    },
+    "expectedName": {
+      "type": "string",
+      "title": "Expected participant name",
+      "default": "",
+      "description": "Optional identity guard: when set and different from participantName, every HAIKU call is refused (catches a wrong --settings file)."
     }
   }
 }

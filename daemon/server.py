@@ -36,7 +36,7 @@ import socket
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import db
 
@@ -222,7 +222,11 @@ def h_ack(conn, params, body, headers, room_id):
 def h_my_rooms(conn, params, body, headers):
     participant, token = _auth_headers(headers)
     rooms = db.list_my_rooms(conn, participant, token)
-    return {"rooms": rooms, "pending_invites": db.list_pending_invites(conn, participant)}
+    return {
+        "rooms": rooms,
+        "pending_invites": db.list_pending_invites(conn, participant),
+        "wake_allowed": db.get_wake_allowed(conn, participant),
+    }
 
 
 @route("GET", r"/participants")
@@ -230,6 +234,17 @@ def h_participants(conn, params, body, headers):
     participant, token = _auth_headers(headers)
     db.authenticate(conn, participant, token)
     return {"participants": db.list_participants(conn, participant)}
+
+
+@route("PUT", r"/participants/(?P<name>[^/]+)/wake_allowed")
+def h_set_wake_allowed(conn, params, body, headers, name):
+    caller, token = _auth_headers(headers)
+    if db.authenticate(conn, caller, token) != "human":
+        raise db.Forbidden("only a human may change wake_allowed")
+    if not isinstance(body.get("allowed"), bool):
+        raise ClientError(400, "allowed must be true or false")
+    db.set_wake_allowed(conn, caller, token, unquote(name), body["allowed"])
+    return {"ok": True, "name": unquote(name), "wake_allowed": body["allowed"]}
 
 
 @route("POST", f"/rooms/{ROOM_ID}/pause")
@@ -311,10 +326,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _read_json_body(self):
-        if self.command != "POST":
+        if self.command not in ("POST", "PUT"):
             return {}
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-            raise ClientError(400, "POST requires Content-Type: application/json")
+            raise ClientError(400, f"{self.command} requires Content-Type: application/json")
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -375,6 +390,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._dispatch("POST")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
 
     def log_message(self, fmt, *args):
         pass  # quiet by default; rooms already have their own event log

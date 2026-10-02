@@ -40,7 +40,7 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # with no user_version set (every db from before this system existed)
 # is treated as v1. A db whose user_version is HIGHER than this code
 # knows is refused outright rather than run against blindly.
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _migrate_v1_to_v2(conn):
@@ -69,7 +69,18 @@ def _migrate_v1_to_v2(conn):
     """)
 
 
-MIGRATIONS = {2: _migrate_v1_to_v2}
+def _migrate_v2_to_v3(conn):
+    """Adds participants.wake_allowed (auto-wake kill switch, default allowed)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(participants)")]
+    if "wake_allowed" not in cols:
+        conn.execute(
+            "ALTER TABLE participants ADD COLUMN wake_allowed INTEGER NOT NULL DEFAULT 1 "
+            "CHECK (wake_allowed IN (0, 1))"
+        )
+        conn.commit()
+
+
+MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3}
 
 
 def _migrate(conn, db_path, existed_before: bool):
@@ -792,6 +803,27 @@ def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
     return result
 
 
+def set_wake_allowed(conn, caller: str, token: str, target: str, allowed: bool) -> None:
+    """Auto-wake kill switch (spec 3a level 3). Human callers only; it can
+    only withhold waking, never enable it past the plugin's own levels."""
+    if authenticate(conn, caller, token) != "human":
+        raise Forbidden("only a human may change wake_allowed")
+    cur = conn.execute(
+        "UPDATE participants SET wake_allowed = ? WHERE name = ? COLLATE NOCASE",
+        (1 if allowed else 0, target),
+    )
+    if cur.rowcount == 0:
+        raise HaikuError(f"no such participant: {target}")
+    conn.commit()
+
+
+def get_wake_allowed(conn, participant: str) -> bool:
+    row = conn.execute(
+        "SELECT wake_allowed FROM participants WHERE name = ?", (participant,)
+    ).fetchone()
+    return bool(row["wake_allowed"]) if row else True
+
+
 def list_participants(conn, caller: str) -> list[dict]:
     """ui-spec.md "Decisions": scoped by caller. A human (the admin, Teddy)
     sees every registered name and kind. An AI sees only participants who
@@ -803,7 +835,8 @@ def list_participants(conn, caller: str) -> list[dict]:
     if row is None:
         raise HaikuError("invalid credentials")
     if row["kind"] == "human":
-        rows = conn.execute("SELECT name, kind FROM participants ORDER BY name").fetchall()
+        rows = conn.execute("SELECT name, kind, wake_allowed FROM participants ORDER BY name").fetchall()
+        return [{"name": r["name"], "kind": r["kind"], "wake_allowed": bool(r["wake_allowed"])} for r in rows]
     else:
         rows = conn.execute(
             """SELECT DISTINCT p.name, p.kind FROM participants p

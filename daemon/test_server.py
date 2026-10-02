@@ -238,6 +238,31 @@ def main():
         check("invite shows up in /me/rooms pending_invites",
               resp["pending_invites"] == [{"room_id": inv_id, "room_name": "inv-http", "invited_by": "Teddy"}])
 
+        # --- auto-wake kill switch (spec 3a level 3) ---
+        check("/me/rooms reports wake_allowed true by default", resp.get("wake_allowed") is True)
+        status, resp = c.request("PUT", "/participants/LobbyCheck/wake_allowed", body={"allowed": False},
+                                 headers=c.auth("LobbyCheck", lobby_tok))
+        check(f"an AI cannot set wake_allowed (403) got {status} {resp}", status == 403)
+        status, resp = c.request("PUT", "/participants/LobbyCheck/wake_allowed", body={"allowed": False})
+        check("setting wake_allowed requires auth", status == 401)
+        status, resp = c.request("PUT", "/participants/LobbyCheck/wake_allowed", body={"allowed": "no"},
+                                 headers=c.auth("Teddy", teddy_tok))
+        check("wake_allowed must be a real boolean", status == 400)
+        status, resp = c.request("PUT", "/participants/Nobody/wake_allowed", body={"allowed": False},
+                                 headers=c.auth("Teddy", teddy_tok))
+        check("wake_allowed on an unknown participant is 400", status == 400)
+        status, resp = c.request("PUT", "/participants/LobbyCheck/wake_allowed", body={"allowed": False},
+                                 headers=c.auth("Teddy", teddy_tok))
+        check(f"a human can withhold waking got {status} {resp}", status == 200 and resp["wake_allowed"] is False)
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("LobbyCheck", lobby_tok))
+        check("the watcher sees wake_allowed false in /me/rooms", resp.get("wake_allowed") is False)
+        status, resp = c.request("GET", "/participants", headers=c.auth("Teddy", teddy_tok))
+        check("a human's participant list shows wake_allowed",
+              any(p["name"] == "LobbyCheck" and p["wake_allowed"] is False for p in resp["participants"]))
+        c.request("PUT", "/participants/LobbyCheck/wake_allowed", body={"allowed": True}, headers=c.auth("Teddy", teddy_tok))
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("LobbyCheck", lobby_tok))
+        check("a human can restore waking", resp.get("wake_allowed") is True)
+
         # --- room metadata / roster scoping (Vero's read-only pass, 2026-10-02) ---
         status, resp = c.request("GET", f"/rooms/{room_id}")
         check("GET /rooms/{id} requires auth", status == 401)

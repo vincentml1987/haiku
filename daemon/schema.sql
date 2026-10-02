@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS participants (
     kind        TEXT NOT NULL CHECK (kind IN ('human', 'ai')),
     address     TEXT,
     token_hash  TEXT NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- Auto-wake kill switch (spec 3a level 3): human-set, restrict-only.
+    wake_allowed INTEGER NOT NULL DEFAULT 1 CHECK (wake_allowed IN (0, 1))
 );
 
 -- Case-insensitive uniqueness: without this, a second participant named

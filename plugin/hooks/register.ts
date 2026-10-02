@@ -34,6 +34,17 @@ import {
   ackEvents,
 } from './client'
 import { formatRoomDelivery, makeNonce, type HaikuEvent } from './format'
+import {
+  type MeRooms,
+  type WakeState,
+  EMPTY_WAKE_STATE,
+  WAKE_PROMPT,
+  MIN_POLL_SECONDS,
+  DEFAULT_POLL_SECONDS,
+  parseBool,
+  parseSeconds,
+  decideWake,
+} from './wake'
 
 /**
  * Builds the fetch closure client.ts's functions take. $.http.fetch is
@@ -93,7 +104,7 @@ type JoinedRoom = { id: string; name: string }
  * identity — cheap, and correct regardless of how the scope question
  * (Vero's review, item 3) actually resolves once verified empirically.
  */
-function storeKey(kind: 'joinedRooms' | 'lastSeenSeq', participantName: string): string {
+function storeKey(kind: 'joinedRooms' | 'lastSeenSeq' | 'wakeState' | 'autoWakeSession', participantName: string): string {
   return `${kind}:${participantName}`
 }
 
@@ -104,6 +115,15 @@ function creds(options: Record<string, unknown>): HaikuCreds {
   if (!participantName || !participantToken) {
     throw new Error(
       'HAIKU is not configured: set participantName and participantToken (register with the daemon first, see README).',
+    )
+  }
+  // Identity guard: a wrong --settings file means a wrong identity with no
+  // warning otherwise (2026-10-02 incident). With expectedName set, a
+  // mismatch makes every HAIKU call fail loudly instead.
+  const expectedName = String(options.expectedName ?? '')
+  if (expectedName && expectedName !== participantName) {
+    throw new Error(
+      `HAIKU identity mismatch: this session is configured as "${participantName}" but expectedName is "${expectedName}". Wrong --settings file? Refusing to act.`,
     )
   }
   return { daemonUrl, participantName, participantToken }
@@ -206,7 +226,42 @@ async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c:
   await setLastSeen($, c.participantName, room.id, batch.max_seq)
 }
 
+/** Level 1 (spec 3a): Teddy's per-identity ceiling. Default OFF; read at
+ * launch from the settings file, never writable by the session itself. */
+function wakeCeiling(options: Record<string, unknown>): boolean {
+  return parseBool(options.autoWake)
+}
+
+/** Level 2: the session's own flag. Unset means "on, up to the ceiling";
+ * it is stored (restrict-only: an "off" persists, which is the safe side). */
+async function sessionWakeFlag($: Engine, name: string): Promise<boolean> {
+  const v = await $.store.get(storeKey('autoWakeSession', name))
+  return v !== false
+}
+
+/** `/haiku-wake` and haiku_autowake share this: "on" is refused above the ceiling. */
+async function applyWakeMode($: Engine, options: Record<string, unknown>, mode: string): Promise<string> {
+  const c = creds(options)
+  const ceiling = wakeCeiling(options)
+  if (mode === 'on') {
+    if (!ceiling) {
+      return "autoWake stays off: this identity's settings file does not enable it (it is a ceiling only Teddy can raise, by relaunching with a changed file)."
+    }
+    await $.store.set(storeKey('autoWakeSession', c.participantName), true)
+  } else if (mode === 'off') {
+    await $.store.set(storeKey('autoWakeSession', c.participantName), false)
+  } else if (mode !== 'status') {
+    return 'usage: on | off | status'
+  }
+  const flag = await sessionWakeFlag($, c.participantName)
+  const eff = ceiling && flag
+  return `HAIKU as ${c.participantName}, autoWake: ${eff ? 'on' : 'off'} (ceiling ${ceiling ? 'on' : 'off'}, session ${flag ? 'on' : 'off'}; the daemon's wake_allowed switch can still withhold it)`
+}
+
 export const register: Register = (on, options) => {
+  // Module state: dropped on reload, which is why the dedupe lives in $.store.
+  let waking = false
+  let poller: { cancel: () => void } | undefined
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'haiku_send',
@@ -288,6 +343,67 @@ export const register: Register = (on, options) => {
       inputSchema: { type: 'object', properties: {} },
     })
 
+    // --- identity visibility + auto-wake (spec 3a) ---
+    try {
+      const c0 = creds(options)
+      const eff = wakeCeiling(options) && (await sessionWakeFlag($, c0.participantName))
+      const line = `HAIKU as ${c0.participantName}, autoWake: ${eff ? 'on' : 'off'}`
+      $.ui.status(line)
+      $.ui.toast(line)
+    } catch (err) {
+      $.ui.toast(err instanceof Error ? err.message : String(err))
+    }
+    await $.command.register({
+      name: 'haiku-wake',
+      description: 'Turn HAIKU auto-wake on/off for this session (only up to the settings-file ceiling).',
+      argumentHint: '[on|off|status]',
+      immediate: true,
+    })
+    await $.tool.register({
+      name: 'haiku_autowake',
+      description: 'Turn your own HAIKU auto-wake on or off. "on" only works if your settings file already allows autoWake; you cannot raise that yourself. "off" means not now.',
+      inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['on', 'off', 'status'] } }, required: ['mode'] },
+    })
+
+    poller?.cancel()
+    poller = undefined
+    if (wakeCeiling(options)) {
+      const pollMs = parseSeconds(options.autoWakePollSeconds, DEFAULT_POLL_SECONDS, MIN_POLL_SECONDS) * 1000
+      const gapMs = parseSeconds(options.autoWakeMinGapSeconds, 60, 0) * 1000
+
+      const watchOnce = async () => {
+        if (waking) return
+        waking = true
+        try {
+          const c = creds(options)
+          if (!(await sessionWakeFlag($, c.participantName))) return
+          const fetch = makeFetch($, c)
+          const me = (await fetch('GET', '/me/rooms')) as MeRooms
+          const stored = (await $.store.get(storeKey('wakeState', c.participantName))) as WakeState | undefined
+          const st = stored ?? EMPTY_WAKE_STATE
+          const d = decideWake(me, st, await $.clock.now(), gapMs)
+          if (JSON.stringify(d.state) !== JSON.stringify(st)) {
+            // Persist BEFORE submitting: at-most-once, so a failed submit can
+            // never turn into a loop of billed re-wakes.
+            await $.store.set(storeKey('wakeState', c.participantName), d.state)
+          }
+          if (d.wake) await $.prompt.submit({ text: WAKE_PROMPT })
+        } catch {
+          // daemon down, not configured, name mismatch: stay quiet, try next tick
+        } finally {
+          waking = false
+        }
+      }
+
+      // First poll is jittered so every AI in a room does not fire together
+      // after a human message resets the hop cap.
+      const jitter = Math.floor(Math.random() * pollMs)
+      $.clock.after(jitter, () => {
+        void watchOnce()
+        poller = $.clock.every(pollMs, () => void watchOnce())
+      })
+    }
+
     try {
       await catchUp($, creds(options))
     } catch {
@@ -305,6 +421,22 @@ export const register: Register = (on, options) => {
       // see session.start — silent here too, never block a user prompt over it
     }
     return next(e)
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_autowake' }, async ($, e) => {
+    try {
+      return { result: await applyWakeMode($, options, String(e.mode ?? 'status')) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('command.run', { command: 'haiku-wake' }, async ($, e) => {
+    try {
+      return { text: await applyWakeMode($, options, (e.args || 'status').trim().toLowerCase()) }
+    } catch (err) {
+      return { text: err instanceof Error ? err.message : String(err) }
+    }
   })
 
   on('tool.call', { tool: 'mcp__haiku__haiku_send' }, async ($, e) => {
