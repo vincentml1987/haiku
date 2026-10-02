@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import uuid
 from pathlib import Path
@@ -24,12 +25,88 @@ from datetime import datetime, timezone
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# Schema versioning, tracked in SQLite's own PRAGMA user_version (an
+# integer baked into the db file, no extra table needed). schema.sql's
+# CREATE TABLE IF NOT EXISTS only ever applies to a brand-new db — an
+# existing db's tables keep whatever constraints they were created with
+# forever, so a change like a CHECK constraint (e.g. adding 'archive' to
+# events.type, which broke live on 2026-10-02 before this existed) needs
+# an explicit, versioned migration to reach every db that predates it.
+#
+# CURRENT_SCHEMA_VERSION is "the schema in schema.sql right now". Each
+# key in MIGRATIONS is a target version; its function brings a db at
+# (that version - 1) up to that version, idempotently, inside its own
+# transaction. Version 1 is the implicit baseline: any pre-existing db
+# with no user_version set (every db from before this system existed)
+# is treated as v1. A db whose user_version is HIGHER than this code
+# knows is refused outright rather than run against blindly.
+CURRENT_SCHEMA_VERSION = 2
+
+
+def _migrate_v1_to_v2(conn):
+    """Adds 'archive' to events.type's CHECK constraint. SQLite can't ALTER
+    a CHECK constraint, so the table is recreated and every row copied."""
+    conn.executescript("""
+        BEGIN;
+        CREATE TABLE events_new (
+            room_id     TEXT NOT NULL REFERENCES rooms(id),
+            seq         INTEGER NOT NULL,
+            ts          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            author      TEXT NOT NULL REFERENCES participants(name),
+            author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'ai')),
+            type        TEXT NOT NULL CHECK (type IN
+                            ('message', 'join', 'leave', 'topic_change',
+                             'pass', 'pause', 'resume', 'archive')),
+            addressed_to TEXT,
+            body        TEXT,
+            PRIMARY KEY (room_id, seq)
+        );
+        INSERT INTO events_new SELECT * FROM events;
+        DROP TABLE events;
+        ALTER TABLE events_new RENAME TO events;
+        CREATE INDEX idx_events_room_seq ON events(room_id, seq);
+        COMMIT;
+    """)
+
+
+MIGRATIONS = {2: _migrate_v1_to_v2}
+
+
+def _migrate(conn, db_path, existed_before: bool):
+    if not existed_before:
+        # schema.sql just created this db fresh, already at the latest shape.
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+        return
+
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current == 0:
+        current = 1  # pre-existing db from before versioning existed
+
+    if current > CURRENT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {current} is newer than this code understands "
+            f"(max {CURRENT_SCHEMA_VERSION}) — refusing to start against it"
+        )
+
+    if current < CURRENT_SCHEMA_VERSION:
+        if db_path != ":memory:" and Path(db_path).exists():
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+            backup_path = f"{db_path}.backup-before-migration-v{current}-to-v{CURRENT_SCHEMA_VERSION}"
+            shutil.copy2(db_path, backup_path)
+        for v in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
+            MIGRATIONS[v](conn)
+            conn.execute(f"PRAGMA user_version = {v}")
+
 
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, isolation_level=None)  # manual tx control, see _transaction
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    existed_before = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+    ).fetchone() is not None
     conn.executescript(SCHEMA_PATH.read_text())
+    _migrate(conn, db_path, existed_before)
     _ensure_admin_secret(conn, db_path)
     return conn
 

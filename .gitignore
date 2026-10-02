@@ -4,6 +4,7 @@ daemon/*.db-journal
 daemon/*.db-wal
 daemon/*.db-shm
 daemon/*.admin_secret
+daemon/*.backup-before-migration-*
 
 # Python
 __pycache__/
