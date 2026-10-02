@@ -26,6 +26,14 @@ def cleanup(conn):
             os.remove(p)
 
 
+def _can_auth(conn, name, token):
+    try:
+        db.authenticate(conn, name, token)
+        return True
+    except db.HaikuError:
+        return False
+
+
 def check(label, cond):
     status = "ok" if cond else "FAIL"
     print(f"[{status}] {label}")
@@ -36,10 +44,43 @@ def check(label, cond):
 def main():
     conn = fresh_conn()
     try:
-        teddy_tok = db.register_participant(conn, "Teddy", "human")
-        qualia_tok = db.register_participant(conn, "Qualia", "ai")
-        vero_tok = db.register_participant(conn, "Vero", "ai")
-        outsider_tok = db.register_participant(conn, "Out", "ai")
+        admin_secret = db._admin_secret_path(DBFILE).read_text().strip()
+
+        # --- registration back door is closed ---
+        try:
+            db.register_human(conn, "Teddy", admin_secret="wrong-secret")
+            check("human registration without real admin secret rejected", False)
+        except db.HaikuError:
+            check("human registration without real admin secret rejected", True)
+
+        teddy_tok = db.register_human(conn, "Teddy", admin_secret=admin_secret)
+        qualia_tok = db.register_ai(conn, "Qualia")
+        vero_tok = db.register_ai(conn, "Vero")
+        outsider_tok = db.register_ai(conn, "Out")
+
+        try:
+            db.register_ai(conn, "teddy")  # case-insensitive squat on a human name
+            check("case-insensitive name squat rejected", False)
+        except db.HaikuError:
+            check("case-insensitive name squat rejected", True)
+
+        try:
+            db.register_human(conn, "Teddy", admin_secret=admin_secret)  # re-claim existing name
+            check("re-registering an existing name via register_* rejected", False)
+        except db.HaikuError:
+            check("re-registering an existing name via register_* rejected", True)
+
+        # --- token rotation requires proof, not just the name ---
+        try:
+            db.rotate_token(conn, "Teddy", credential="not-teddys-token")
+            check("rotate_token without valid token or admin secret rejected", False)
+        except db.HaikuError:
+            check("rotate_token without valid token or admin secret rejected", True)
+
+        new_teddy_tok = db.rotate_token(conn, "Teddy", credential=admin_secret, credential_is_admin_secret=True)
+        check("admin-secret rotation issues a working token", db.authenticate(conn, "Teddy", new_teddy_tok) == "human")
+        check("old token invalidated after rotation", not _can_auth(conn, "Teddy", teddy_tok))
+        teddy_tok = new_teddy_tok
 
         room_id = db.create_room(conn, "lobby", "Teddy", teddy_tok, hop_limit=3)
         db.join_room(conn, room_id, "Qualia", qualia_tok)
@@ -183,17 +224,17 @@ def main():
         # --- catch-up window on first join ---
         for i in range(5):
             db.send_message(conn, room_id, "Teddy", teddy_tok, f"filler {i}", addressed_to=["all"])
-        newcomer_tok = db.register_participant(conn, "Newcomer", "ai")
+        newcomer_tok = db.register_ai(conn, "Newcomer")
         db.join_room(conn, room_id, "Newcomer", newcomer_tok, catch_up=2)
         first_read = db.read_events(conn, room_id, "Newcomer", newcomer_tok)
         check("catch_up window limits first read", len(first_read) == 2)
 
-        # --- re-registering with a different kind is rejected ---
+        # --- an AI can't claim an existing human's name via open self-registration ---
         try:
-            db.register_participant(conn, "Teddy", "ai")
-            check("kind change on re-register rejected", False)
+            db.register_ai(conn, "Teddy")
+            check("AI cannot claim an existing name", False)
         except db.HaikuError:
-            check("kind change on re-register rejected", True)
+            check("AI cannot claim an existing name", True)
 
         # --- archived room rejects sends ---
         with db._transaction(conn):

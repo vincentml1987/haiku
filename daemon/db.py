@@ -13,7 +13,9 @@ human-only resume actually mean something (reviewed in by Vero).
 
 import contextlib
 import hashlib
+import hmac
 import json
+import os
 import secrets
 import sqlite3
 import uuid
@@ -28,7 +30,35 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
+    _ensure_admin_secret(conn, db_path)
     return conn
+
+
+def _admin_secret_path(db_path: str) -> Path:
+    return Path(str(db_path) + ".admin_secret")
+
+
+def _ensure_admin_secret(conn, db_path: str):
+    """The admin secret gates human registration and token recovery (see
+    register_human, rotate_token). Generated once per database, written
+    plaintext to a local file next to the db — never stored in the db
+    itself, only its hash is. That file must never be committed; it's
+    covered by .gitignore (daemon/*.admin_secret)."""
+    secret_path = _admin_secret_path(db_path)
+    if secret_path.exists():
+        secret = secret_path.read_text().strip()
+    else:
+        secret = secrets.token_urlsafe(32)
+        secret_path.write_text(secret)
+        try:
+            os.chmod(secret_path, 0o600)
+        except OSError:
+            pass  # best-effort on platforms without POSIX perms (e.g. Windows)
+    conn.execute(
+        """INSERT INTO daemon_config (k, v) VALUES ('admin_secret_hash', ?)
+           ON CONFLICT(k) DO UPDATE SET v = excluded.v""",
+        (_hash_token(secret),),
+    )
 
 
 def _now() -> str:
@@ -59,26 +89,74 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def register_participant(conn, name: str, kind: str, address: str | None = None) -> str:
-    """Registers a new participant (or re-registers, rotating its token —
-    callers should register once and hold onto the returned token).
-    Returns the plaintext token; only its hash is ever stored."""
-    if kind not in ("human", "ai"):
-        raise HaikuError(f"invalid participant kind: {kind}")
-    existing = conn.execute(
-        "SELECT kind FROM participants WHERE name = ?", (name,)
+def _verify_admin_secret(conn, secret: str) -> bool:
+    row = conn.execute(
+        "SELECT v FROM daemon_config WHERE k = 'admin_secret_hash'"
     ).fetchone()
-    if existing is not None and existing["kind"] != kind:
-        raise HaikuError(
-            f"{name} is already registered as {existing['kind']}, cannot re-register as {kind}"
-        )
+    return row is not None and hmac.compare_digest(row["v"], _hash_token(secret))
+
+
+def _name_taken(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM participants WHERE name = ? COLLATE NOCASE", (name,)
+    ).fetchone() is not None
+
+
+def register_ai(conn, name: str, address: str | None = None) -> str:
+    """Open self-registration — any caller can claim a brand-new AI name.
+    This is deliberately NOT how humans are created (see register_human):
+    open registration is the identity back door Vero's review found, so
+    it's scoped to the one kind where squatting a fresh name has no
+    real stakes attached yet (no room history, no standing obligations)."""
+    if _name_taken(conn, name):
+        raise HaikuError(f"{name} is already registered — use rotate_token to recover access")
     token = secrets.token_urlsafe(32)
     with _transaction(conn):
         conn.execute(
-            """INSERT INTO participants (name, kind, address, token_hash) VALUES (?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET address = excluded.address,
-                                                token_hash = excluded.token_hash""",
-            (name, kind, address, _hash_token(token)),
+            "INSERT INTO participants (name, kind, address, token_hash) VALUES (?, 'ai', ?, ?)",
+            (name, address, _hash_token(token)),
+        )
+    return token
+
+
+def register_human(conn, name: str, admin_secret: str, address: str | None = None) -> str:
+    """The only way to create a human participant. Requires the daemon's
+    admin secret (see _ensure_admin_secret) — never reachable by an AI
+    that only holds its own participant token."""
+    if not _verify_admin_secret(conn, admin_secret):
+        raise HaikuError("invalid admin secret")
+    if _name_taken(conn, name):
+        raise HaikuError(f"{name} is already registered — use rotate_token to recover access")
+    token = secrets.token_urlsafe(32)
+    with _transaction(conn):
+        conn.execute(
+            "INSERT INTO participants (name, kind, address, token_hash) VALUES (?, 'human', ?, ?)",
+            (name, address, _hash_token(token)),
+        )
+    return token
+
+
+def rotate_token(conn, name: str, credential: str, credential_is_admin_secret: bool = False) -> str:
+    """Re-issues a participant's token. Proves the right to do so either by
+    presenting the CURRENT valid token, or — for recovery, e.g. Teddy lost
+    his token file — the admin secret. Never open on name alone; that was
+    the back door (anyone could call the old register_participant("Teddy",
+    ...) and seize the name)."""
+    row = conn.execute(
+        "SELECT kind, token_hash FROM participants WHERE name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        raise HaikuError(f"unknown participant: {name}")
+    if credential_is_admin_secret:
+        if not _verify_admin_secret(conn, credential):
+            raise HaikuError("invalid admin secret")
+    elif not hmac.compare_digest(row["token_hash"], _hash_token(credential)):
+        raise HaikuError("invalid credentials")
+    token = secrets.token_urlsafe(32)
+    with _transaction(conn):
+        conn.execute(
+            "UPDATE participants SET token_hash = ? WHERE name = ?",
+            (_hash_token(token), name),
         )
     return token
 
@@ -88,7 +166,7 @@ def authenticate(conn, name: str, token: str) -> str:
     row = conn.execute(
         "SELECT kind, token_hash FROM participants WHERE name = ?", (name,)
     ).fetchone()
-    if row is None or row["token_hash"] != _hash_token(token):
+    if row is None or not hmac.compare_digest(row["token_hash"], _hash_token(token)):
         raise HaikuError("invalid credentials")
     return row["kind"]
 

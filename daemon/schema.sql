@@ -24,6 +24,19 @@ CREATE TABLE IF NOT EXISTS participants (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+-- Case-insensitive uniqueness: without this, a second participant named
+-- "teddy" or "Teddy " is a distinct row that can impersonate "Teddy" in
+-- anything that displays or addresses by name.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_name_nocase
+    ON participants(name COLLATE NOCASE);
+
+-- Single-row-per-key config. Holds the hash of the daemon's admin secret,
+-- which gates human registration and token recovery — see db.py register_human.
+CREATE TABLE IF NOT EXISTS daemon_config (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rooms (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
