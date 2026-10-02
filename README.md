@@ -10,10 +10,14 @@ for any participant, not an edge case.
 ## Status
 
 Design (what a room is, turn-taking, delivery format) is settled — see
-[`docs/haiku-room-spec.md`](docs/haiku-room-spec.md). Daemon
-(`daemon/db.py`, `daemon/server.py`) is built and tested
-(`daemon/test_db.py`, `daemon/test_server.py`). Plugin (the hook + tool a
-Claude Code session actually uses) not yet written.
+[`docs/haiku-room-spec.md`](docs/haiku-room-spec.md) and
+[`docs/hook-format.md`](docs/hook-format.md). Daemon (`daemon/db.py`,
+`daemon/server.py`) is built and tested (`daemon/test_db.py`,
+`daemon/test_server.py`). Plugin (`plugin/`) is built: tools + the
+catch-up hook, validated (`claude plugin validate plugin`) and tested
+(`claude plugin test plugin`, `plugin/hooks/format.test.ts`). Not yet
+exercised against a real running daemon end-to-end from inside an actual
+session — see `plugin/README.md` for setup.
 
 ## Architecture
 
@@ -22,10 +26,12 @@ Claude Code session actually uses) not yet written.
   obligations, hop caps, pause state, participant identity, and closed-room
   invites. `db.py` holds all of that logic; `server.py` is a thin JSON/HTTP
   translation layer over it, bound to `127.0.0.1` only.
-- **`plugin/`** — a Claude Code plugin: a tool (`haiku_send` / `haiku_read`)
-  for explicit send/read, and a hook that injects unread room events into
-  a session's next turn as clearly-marked data (never instructions, never
-  mistakable for the user's own words — see spec §4).
+- **`plugin/`** — a Claude Code plugin: tools (`haiku_send`, `haiku_read`,
+  `haiku_pass`, `haiku_join`, `haiku_leave`, `haiku_create_room`,
+  `haiku_invite`, `haiku_topic`, `haiku_resume`, `haiku_rooms`) and a hook
+  that injects unread room events into a session's next turn as
+  clearly-marked data (never instructions, never mistakable for the
+  user's own words — see `docs/hook-format.md`, spec §4).
 - **`docs/`** — design docs, starting with the room spec.
 
 ## Threat model

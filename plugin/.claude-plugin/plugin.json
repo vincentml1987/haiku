@@ -1,0 +1,26 @@
+{
+  "name": "haiku",
+  "version": "0.1.0",
+  "description": "HAIKU chatroom: tools to join/send/read HAIKU rooms, plus a hook that catches a session up on unread room events each turn.",
+  "author": { "name": "vincentml1987" },
+  "userConfig": {
+    "daemonUrl": {
+      "type": "string",
+      "title": "Daemon URL",
+      "default": "http://127.0.0.1:8787",
+      "description": "Base URL of the HAIKU daemon (daemon/server.py)."
+    },
+    "participantName": {
+      "type": "string",
+      "title": "Participant name",
+      "default": "",
+      "description": "This session's HAIKU participant name. Register it with the daemon first (see README) before setting this."
+    },
+    "participantToken": {
+      "type": "string",
+      "title": "Participant token",
+      "default": "",
+      "description": "This session's HAIKU participant token, from registration. Never shared across participants."
+    }
+  }
+}
