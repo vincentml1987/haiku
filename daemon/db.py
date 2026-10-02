@@ -473,6 +473,30 @@ def ack(conn, room_id: str, participant: str, token: str, through_seq: int):
     _ack(conn, room_id, participant, through_seq)
 
 
+def set_topic(conn, room_id: str, author: str, token: str, topic: str) -> int:
+    author_kind = authenticate(conn, author, token)
+    room = _get_room(conn, room_id)
+    if room["state"] == "archived":
+        raise HaikuError("room is archived")
+    _require_member(conn, room_id, author)
+    with _transaction(conn):
+        seq = _insert_event(conn, room_id, author, author_kind, "topic_change", body=topic)
+        conn.execute("UPDATE rooms SET topic = ? WHERE id = ?", (topic, room_id))
+    return seq
+
+
+def get_room(conn, room_id: str) -> dict:
+    return dict(_get_room(conn, room_id))
+
+
+def list_rooms(conn, state: str | None = None) -> list[dict]:
+    if state is not None:
+        rows = conn.execute("SELECT * FROM rooms WHERE state = ? ORDER BY created_at", (state,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM rooms ORDER BY created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
 def room_roster(conn, room_id: str) -> list[dict]:
     rows = conn.execute(
         """SELECT participant, status, owes_reply_to_seq

@@ -11,7 +11,7 @@ DBFILE = "test_haiku.db"
 
 
 def fresh_conn():
-    for ext in ("", "-wal", "-shm", "-journal"):
+    for ext in ("", "-wal", "-shm", "-journal", ".admin_secret"):
         p = DBFILE + ext
         if os.path.exists(p):
             os.remove(p)
@@ -20,7 +20,7 @@ def fresh_conn():
 
 def cleanup(conn):
     conn.close()
-    for ext in ("", "-wal", "-shm", "-journal"):
+    for ext in ("", "-wal", "-shm", "-journal", ".admin_secret"):
         p = DBFILE + ext
         if os.path.exists(p):
             os.remove(p)
