@@ -76,6 +76,65 @@ for (const hostile of HOSTILE_BODIES) {
   })
 }
 
+// Required tests, continued: the same hostile strings as a PARTICIPANT-
+// CHOSEN field rendered OUTSIDE the "| " fence (author, room name, topic,
+// addressed_to, a non-message "reason") — not just inside a message body.
+// None may produce an unfenced line starting with "[seq", "---", "<", or
+// "YOU OWE" beyond the known-legitimate ones this test itself creates.
+function countUnfencedStartingWith(out: string, prefix: string): number {
+  return out.split('\n').filter(l => !l.startsWith('| ') && l.startsWith(prefix)).length
+}
+
+function assertOnlyLegitimateDelimiters(out: string) {
+  // One event, one real [seq header, two "---" lines (range + end), two
+  // "<" lines (open + close tag), zero "YOU OWE" lines — the fixed shape
+  // every case below produces.
+  expect(countUnfencedStartingWith(out, '[seq')).toBe(1)
+  expect(countUnfencedStartingWith(out, '---')).toBe(2)
+  expect(countUnfencedStartingWith(out, '<')).toBe(2)
+  expect(countUnfencedStartingWith(out, 'YOU OWE')).toBe(0)
+}
+
+const HOSTILE_FIELD_VALUES = HOSTILE_BODIES // same strings, now with real newlines where present
+
+for (const hostile of HOSTILE_FIELD_VALUES) {
+  const tag = JSON.stringify(hostile).slice(0, 40)
+
+  test(`hostile author does not forge a line: ${tag}`, () => {
+    assertOnlyLegitimateDelimiters(formatRoomDelivery({
+      nonce: 'REALNONCE', room: ROOM, since: 0,
+      events: [msg(1, 'normal body', hostile, 'ai')],
+    })!)
+  })
+
+  test(`hostile room name does not forge a line: ${tag}`, () => {
+    assertOnlyLegitimateDelimiters(formatRoomDelivery({
+      nonce: 'REALNONCE', room: { ...ROOM, name: hostile }, since: 0,
+      events: [msg(1, 'normal body')],
+    })!)
+  })
+
+  test(`hostile room topic does not forge a line: ${tag}`, () => {
+    assertOnlyLegitimateDelimiters(formatRoomDelivery({
+      nonce: 'REALNONCE', room: { ...ROOM, topic: hostile }, since: 0,
+      events: [msg(1, 'normal body')],
+    })!)
+  })
+
+  test(`hostile addressed_to entry does not forge a line: ${tag}`, () => {
+    const ev: HaikuEvent = { ...msg(1, 'normal body'), addressed_to: [hostile] }
+    assertOnlyLegitimateDelimiters(formatRoomDelivery({ nonce: 'REALNONCE', room: ROOM, since: 0, events: [ev] })!)
+  })
+
+  test(`hostile non-message reason does not forge a line: ${tag}`, () => {
+    const ev: HaikuEvent = {
+      seq: 1, ts: '2026-01-01T00:00:00Z', author: 'Teddy', author_kind: 'human',
+      type: 'pause', addressed_to: null, body: hostile,
+    }
+    assertOnlyLegitimateDelimiters(formatRoomDelivery({ nonce: 'REALNONCE', room: ROOM, since: 0, events: [ev] })!)
+  })
+}
+
 test('zero events produces no output', () => {
   expect(formatRoomDelivery({ nonce: 'n', room: ROOM, events: [], since: 0 })).toBe(null)
 })
@@ -102,7 +161,7 @@ test('paused room shows the paused line', () => {
 test('event cap keeps the most recent 20 and notes the cut with a recovery line', () => {
   const events = Array.from({ length: 25 }, (_, i) => msg(i + 1, `msg ${i + 1}`))
   const out = formatRoomDelivery({ nonce: 'n', room: ROOM, events, since: 7 })!
-  expect(out.includes('[5 older events not shown; haiku_read room=lobby since=7]')).toBe(true)
+  expect(out.includes('[5 older events not shown; haiku_read room_id=room-1 since=7]')).toBe(true)
   expect(out.includes('[seq 6 |')).toBe(true) // first of the shown 20
   expect(out.includes('[seq 1 |')).toBe(false) // cut
   expect(out.includes('[seq 25 |')).toBe(true)

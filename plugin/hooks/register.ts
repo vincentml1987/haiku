@@ -73,8 +73,19 @@ function makeFetch($: Engine, c: HaikuCreds): HaikuFetch {
 
 type JoinedRoom = { id: string; name: string }
 
-const STORE_JOINED_ROOMS = 'joinedRooms'
-const STORE_LAST_SEEN = 'lastSeenSeq' // { [roomId]: number } — client-side hint only, for the recovery line
+/**
+ * $.store is documented as living "under the user's Claude Code
+ * configuration directory" — that reads as scoped to the plugin's NAME,
+ * not to a session or even necessarily a project. If two sessions (e.g.
+ * Qualia's and Vero's) both load a plugin literally named "haiku", they
+ * may share one store. Every key here is therefore namespaced by
+ * participantName so a shared store still partitions correctly per
+ * identity — cheap, and correct regardless of how the scope question
+ * (Vero's review, item 3) actually resolves once verified empirically.
+ */
+function storeKey(kind: 'joinedRooms' | 'lastSeenSeq', participantName: string): string {
+  return `${kind}:${participantName}`
+}
 
 function creds(options: Record<string, unknown>): HaikuCreds {
   const daemonUrl = String(options.daemonUrl ?? 'http://127.0.0.1:8787')
@@ -88,31 +99,31 @@ function creds(options: Record<string, unknown>): HaikuCreds {
   return { daemonUrl, participantName, participantToken }
 }
 
-async function getJoinedRooms($: Engine): Promise<JoinedRoom[]> {
-  const v = await $.store.get(STORE_JOINED_ROOMS)
+async function getJoinedRooms($: Engine, participantName: string): Promise<JoinedRoom[]> {
+  const v = await $.store.get(storeKey('joinedRooms', participantName))
   return Array.isArray(v) ? (v as JoinedRoom[]) : []
 }
 
-async function addJoinedRoom($: Engine, room: JoinedRoom) {
-  const rooms = await getJoinedRooms($)
+async function addJoinedRoom($: Engine, participantName: string, room: JoinedRoom) {
+  const rooms = await getJoinedRooms($, participantName)
   if (!rooms.some(r => r.id === room.id)) {
-    await $.store.set(STORE_JOINED_ROOMS, [...rooms, room])
+    await $.store.set(storeKey('joinedRooms', participantName), [...rooms, room])
   }
 }
 
-async function removeJoinedRoom($: Engine, roomId: string) {
-  const rooms = await getJoinedRooms($)
-  await $.store.set(STORE_JOINED_ROOMS, rooms.filter(r => r.id !== roomId))
+async function removeJoinedRoom($: Engine, participantName: string, roomId: string) {
+  const rooms = await getJoinedRooms($, participantName)
+  await $.store.set(storeKey('joinedRooms', participantName), rooms.filter(r => r.id !== roomId))
 }
 
-async function getLastSeen($: Engine, roomId: string): Promise<number> {
-  const v = (await $.store.get(STORE_LAST_SEEN)) as Record<string, number> | undefined
+async function getLastSeen($: Engine, participantName: string, roomId: string): Promise<number> {
+  const v = (await $.store.get(storeKey('lastSeenSeq', participantName))) as Record<string, number> | undefined
   return v?.[roomId] ?? 0
 }
 
-async function setLastSeen($: Engine, roomId: string, seq: number) {
-  const v = ((await $.store.get(STORE_LAST_SEEN)) as Record<string, number> | undefined) ?? {}
-  await $.store.set(STORE_LAST_SEEN, { ...v, [roomId]: seq })
+async function setLastSeen($: Engine, participantName: string, roomId: string, seq: number) {
+  const v = ((await $.store.get(storeKey('lastSeenSeq', participantName))) as Record<string, number> | undefined) ?? {}
+  await $.store.set(storeKey('lastSeenSeq', participantName), { ...v, [roomId]: seq })
 }
 
 function errorResult(e: unknown) {
@@ -129,45 +140,60 @@ function errorResult(e: unknown) {
  */
 async function catchUp($: Engine, c: HaikuCreds) {
   const fetch = makeFetch($, c)
-  const rooms = await getJoinedRooms($)
+  const rooms = await getJoinedRooms($, c.participantName)
   for (const room of rooms) {
-    let batch: { events: HaikuEvent[] }
+    // One room's failure (daemon hiccup, room archived mid-session, a bad
+    // append) must not abort every later room's catch-up.
     try {
-      batch = (await readEvents(fetch, room.id, { advance: false, excludeSelf: true })) as { events: HaikuEvent[] }
-    } catch {
-      continue // daemon unreachable or room gone — don't block the turn over it
-    }
-    if (batch.events.length === 0) continue
-
-    let roomInfo: any
-    try {
-      roomInfo = await getRoom(fetch, room.id)
+      await catchUpOneRoom($, fetch, c, room)
     } catch {
       continue
     }
-    const myRoster = (roomInfo.roster as any[]).find(r => r.participant === c.participantName)
-    const owesReplyToSeq: number | null = myRoster?.owes_reply_to_seq ?? null
-    const owesFromAuthor = owesReplyToSeq != null
-      ? batch.events.find(e => e.seq === owesReplyToSeq)?.author ?? null
-      : null
-
-    const since = await getLastSeen($, room.id)
-    const nonce = makeNonce()
-    const block = formatRoomDelivery({
-      nonce,
-      room: { id: roomInfo.id, name: roomInfo.name, topic: roomInfo.topic, state: roomInfo.state, hop_count: roomInfo.hop_count, hop_limit: roomInfo.hop_limit },
-      events: batch.events,
-      since,
-      owesReplyToSeq,
-      owesFromAuthor,
-    })
-    if (!block) continue
-
-    const lastSeq = batch.events[batch.events.length - 1].seq
-    await $.session.append({ message: { type: 'user', isMeta: true, content: [{ type: 'text', text: block }] } })
-    await ackEvents(fetch, room.id, lastSeq)
-    await setLastSeen($, room.id, lastSeq)
   }
+}
+
+async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c: HaikuCreds, room: JoinedRoom) {
+  const since = await getLastSeen($, c.participantName, room.id)
+  const batch = (await readEvents(fetch, room.id, { since, advance: false, excludeSelf: true })) as {
+    events: HaikuEvent[]
+    max_seq: number
+  }
+
+  // max_seq is the highest seq SCANNED (before exclude_self filtering), so
+  // an all-self tail still advances past itself instead of being re-read
+  // every turn forever (Vero's review). Advance even when there's nothing
+  // to show.
+  if (batch.max_seq <= since) return // nothing new at all
+  if (batch.events.length === 0) {
+    await ackEvents(fetch, room.id, batch.max_seq)
+    await setLastSeen($, c.participantName, room.id, batch.max_seq)
+    return
+  }
+
+  const roomInfo = await getRoom(fetch, room.id)
+  const myRoster = (roomInfo.roster as any[]).find(r => r.participant === c.participantName)
+  const owesReplyToSeq: number | null = myRoster?.owes_reply_to_seq ?? null
+  const owesFromAuthor = owesReplyToSeq != null
+    ? batch.events.find(e => e.seq === owesReplyToSeq)?.author ?? null
+    : null
+
+  const nonce = makeNonce()
+  const block = formatRoomDelivery({
+    nonce,
+    room: { id: roomInfo.id, name: roomInfo.name, topic: roomInfo.topic, state: roomInfo.state, hop_count: roomInfo.hop_count, hop_limit: roomInfo.hop_limit },
+    events: batch.events,
+    since,
+    owesReplyToSeq,
+    owesFromAuthor,
+  })
+  if (block) {
+    // SessionAppendArgs only accepts {type, content} — isMeta is not a
+    // caller field; the engine marks a plugin-authored type:'user' row as
+    // not-typed-by-the-person automatically (see $.session.append's doc).
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: block }] } })
+  }
+  await ackEvents(fetch, room.id, batch.max_seq)
+  await setLastSeen($, c.participantName, room.id, batch.max_seq)
 }
 
 export const register: Register = (on, options) => {
@@ -303,10 +329,11 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_join' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const c = creds(options)
+      const fetch = makeFetch($, c)
       const result = await joinRoom(fetch, e.room_id as string, e.catch_up as number | undefined)
       const info = await getRoom(fetch, e.room_id as string)
-      await addJoinedRoom($, { id: info.id, name: info.name })
+      await addJoinedRoom($, c.participantName, { id: info.id, name: info.name })
       return { result }
     } catch (err) {
       return errorResult(err)
@@ -315,9 +342,10 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_leave' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const c = creds(options)
+      const fetch = makeFetch($, c)
       const result = await leaveRoom(fetch, e.room_id as string)
-      await removeJoinedRoom($, e.room_id as string)
+      await removeJoinedRoom($, c.participantName, e.room_id as string)
       return { result }
     } catch (err) {
       return errorResult(err)
@@ -326,13 +354,14 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_create_room' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const c = creds(options)
+      const fetch = makeFetch($, c)
       const result = await createRoom(fetch, e.name as string, {
         topic: e.topic as string | undefined,
         mode: e.mode as 'open' | 'closed' | undefined,
         hop_limit: e.hop_limit as number | undefined,
       })
-      await addJoinedRoom($, { id: (result as any).room_id, name: e.name as string })
+      await addJoinedRoom($, c.participantName, { id: (result as any).room_id, name: e.name as string })
       return { result }
     } catch (err) {
       return errorResult(err)
@@ -371,8 +400,9 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_rooms' }, async $ => {
     try {
-      const fetch = makeFetch($, creds(options))
-      const joined = await getJoinedRooms($)
+      const c = creds(options)
+      const fetch = makeFetch($, c)
+      const joined = await getJoinedRooms($, c.participantName)
       const all = await listRooms(fetch)
       return { result: { joined, all: (all as any).rooms } }
     } catch (err) {

@@ -102,12 +102,28 @@ def _name_taken(conn, name: str) -> bool:
     ).fetchone() is not None
 
 
+def _validate_display_name(name: str, max_len: int = 64):
+    """A name (participant or room) is rendered unfenced in the hook's
+    delivery block (spec §4 / hook-format.md) — author names, room names,
+    and addressed_to entries all sit outside the "| " body fence. The
+    plugin's format.ts sanitizes defensively too, but rejecting a hostile
+    name here means bad data never enters the log at all. Vero's review
+    found this gap: open AI self-registration meant any name, including
+    one containing newlines or a fake event-header line, could land in
+    every future delivery to every room that participant joins."""
+    if not name or len(name) > max_len:
+        raise HaikuError(f"name must be 1-{max_len} characters")
+    if any(ord(c) < 0x20 for c in name) or '<' in name:
+        raise HaikuError("name may not contain control characters, newlines, or '<'")
+
+
 def register_ai(conn, name: str, address: str | None = None) -> str:
     """Open self-registration — any caller can claim a brand-new AI name.
     This is deliberately NOT how humans are created (see register_human):
     open registration is the identity back door Vero's review found, so
     it's scoped to the one kind where squatting a fresh name has no
     real stakes attached yet (no room history, no standing obligations)."""
+    _validate_display_name(name)
     if _name_taken(conn, name):
         raise HaikuError(f"{name} is already registered — use rotate_token to recover access")
     token = secrets.token_urlsafe(32)
@@ -125,6 +141,7 @@ def register_human(conn, name: str, admin_secret: str, address: str | None = Non
     that only holds its own participant token."""
     if not _verify_admin_secret(conn, admin_secret):
         raise HaikuError("invalid admin secret")
+    _validate_display_name(name)
     if _name_taken(conn, name):
         raise HaikuError(f"{name} is already registered — use rotate_token to recover access")
     token = secrets.token_urlsafe(32)
@@ -183,6 +200,7 @@ def _require_member(conn, room_id: str, participant: str):
 def create_room(conn, name: str, created_by: str, token: str, topic: str | None = None,
                  mode: str = "closed", hop_limit: int = 6) -> str:
     authenticate(conn, created_by, token)
+    _validate_display_name(name)
     room_id = str(uuid.uuid4())
     with _transaction(conn):
         conn.execute(
@@ -455,13 +473,18 @@ def resume_room(conn, room_id: str, resumed_by: str, token: str,
 
 def read_events(conn, room_id: str, participant: str, token: str,
                  since: int | None = None, limit: int | None = None,
-                 advance: bool = True, exclude_self: bool = False) -> list[dict]:
-    """Returns events after `since` (explicit pull) or after the stored
-    cursor (default catch-up). With advance=True (default), the cursor is
-    moved forward to the last seq actually returned here — never past
-    what's merely queued (spec §2). The hook should call with
-    advance=False, emit the events into the session, and only then call
-    ack() — so a dropped injection doesn't silently lose events."""
+                 advance: bool = True, exclude_self: bool = False) -> dict:
+    """Returns {"events": [...], "max_seq": N}. `events` is after `since`
+    (explicit pull) or the stored cursor (default catch-up), filtered by
+    `exclude_self` if set. `max_seq` is the highest seq SCANNED in this
+    call — before exclude_self filtering — so a caller can advance its
+    cursor past a self-authored tail even when the visible `events` list
+    is empty (Vero's review: otherwise an all-self tail never advances
+    the cursor and the hook re-reads it forever). With advance=True
+    (default), the cursor moves to `max_seq` — never past what's merely
+    queued (spec §2). The hook should call with advance=False, emit the
+    events into the session, and only then call ack() — so a dropped
+    injection doesn't silently lose events."""
     authenticate(conn, participant, token)
     _get_room(conn, room_id)
     _require_member(conn, room_id, participant)
@@ -473,27 +496,24 @@ def read_events(conn, room_id: str, participant: str, token: str,
         ).fetchone()
         since = cur["last_delivered_seq"] if cur else 0
 
-    query = """SELECT seq, ts, author, author_kind, type, addressed_to, body
-               FROM events WHERE room_id = ? AND seq > ?"""
+    query = "SELECT seq, ts, author, author_kind, type, addressed_to, body FROM events WHERE room_id = ? AND seq > ? ORDER BY seq ASC"
     params = [room_id, since]
-    if exclude_self:
-        query += " AND author != ?"
-        params.append(participant)
-    query += " ORDER BY seq ASC"
     if limit is not None:
         query += " LIMIT ?"
         params.append(limit)
 
-    rows = conn.execute(query, params).fetchall()
+    candidates = conn.execute(query, params).fetchall()
+    max_seq = candidates[-1]["seq"] if candidates else since
+    visible = [r for r in candidates if not (exclude_self and r["author"] == participant)]
     events = [
         {**dict(r), "addressed_to": json.loads(r["addressed_to"]) if r["addressed_to"] else None}
-        for r in rows
+        for r in visible
     ]
 
-    if advance and rows:
-        _ack(conn, room_id, participant, rows[-1]["seq"])
+    if advance and max_seq > since:
+        _ack(conn, room_id, participant, max_seq)
 
-    return events
+    return {"events": events, "max_seq": max_seq}
 
 
 def _ack(conn, room_id: str, participant: str, through_seq: int):

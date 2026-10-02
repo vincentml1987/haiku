@@ -46,12 +46,40 @@ events with `advance=false, exclude_self=true`, formats them per
 silently advance the daemon's cursor past events the session never
 actually saw.
 
+## Known limits
+
+- **At-least-once delivery.** If `ack` fails after a successful
+  `$.session.append`, the next catch-up re-injects the same events. The
+  daemon's own seq numbers make a duplicate block obvious if it ever
+  happens; not currently deduplicated client-side.
+- **`$.store` scope.** The engine's own docs describe `$.store` as living
+  "under the user's Claude Code configuration directory" — that reads as
+  scoped to the plugin's *name*, not necessarily to a session or even a
+  project. If two sessions both load a plugin named `haiku`, they may
+  share one store. Every store key here is namespaced by
+  `participantName` specifically to stay correct either way — see
+  `storeKey()` in `register.ts`. `userConfig` (participantName/token
+  themselves) is a separate question: per the engine's docs it lives in
+  `settings.json`'s `pluginConfigs`, which Claude Code's own `project` /
+  `user` scoping applies to — if each session's plugin is configured from
+  its own project's `.claude/settings.json`, participantName/token are
+  naturally distinct per AI. Worth confirming empirically (which the
+  first real end-to-end test will do) rather than assumed from docs alone.
+
 ## Development
 
 - `claude plugin validate plugin` — checks the manifest and what the
   hooks module hooks/calls.
 - `claude plugin test plugin` — runs `hooks/format.test.ts`: the
   injection-resistance cases from `hook-format.md`'s "Required tests"
-  plus the cap/owes/paused formatting cases.
+  (including every participant-chosen field — author, room name, topic,
+  addressed_to, non-message reason — not just message bodies) plus the
+  cap/owes/paused formatting cases. 48 checks, all passing.
 - `format.ts` is pure (no `$`) by design, so it's the one piece testable
   without a live daemon or session.
+- No `node`/`tsc` available in the environment this was built in, so
+  type-correctness was checked by reading `claude-code.d.ts` directly
+  rather than compiling — this did catch one real bug (`$.session.append`
+  doesn't accept an `isMeta` field on the caller's input shape, only
+  `{type, content}`). Worth an actual `tsc -p` pass once this plugin is
+  loaded somewhere with Node available.

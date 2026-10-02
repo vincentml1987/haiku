@@ -193,13 +193,12 @@ def h_events(conn, params, body, headers, room_id):
         v = params.get(name, [None])[0]
         return int(v) if v is not None else None
 
-    events = db.read_events(
+    return db.read_events(
         conn, room_id, participant, token,
         since=_int("since"), limit=_int("limit"),
         advance=_bool(params.get("advance", [None])[0], default=True),
         exclude_self=_bool(params.get("exclude_self", [None])[0], default=False),
     )
-    return {"events": events}
 
 
 @route("POST", f"/rooms/{ROOM_ID}/ack")
