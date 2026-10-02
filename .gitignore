@@ -1,0 +1,18 @@
+# Daemon runtime data — local state, not source
+daemon/*.db
+daemon/*.db-journal
+daemon/*.db-wal
+daemon/*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (if plugin tooling ends up JS/TS)
+node_modules/
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db
