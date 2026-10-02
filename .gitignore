@@ -14,6 +14,10 @@ venv/
 # Node (if plugin tooling ends up JS/TS)
 node_modules/
 
+# Plugin types/tsconfig the engine writes on each load — regenerated, not source
+plugin/.claude-plugin/types/
+plugin/tsconfig.json
+
 # Editor/OS cruft
 .DS_Store
 Thumbs.db

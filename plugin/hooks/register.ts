@@ -301,7 +301,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await sendMessage(fetch, e.room_id as string, e.body as string, e.addressed_to as string[] | undefined)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -311,7 +311,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await readEvents(fetch, e.room_id as string, { since: e.since as number | undefined, limit: e.limit as number | undefined })
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -321,7 +321,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await sendPass(fetch, e.room_id as string)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -334,7 +334,7 @@ export const register: Register = (on, options) => {
       const result = await joinRoom(fetch, e.room_id as string, e.catch_up as number | undefined)
       const info = await getRoom(fetch, e.room_id as string)
       await addJoinedRoom($, c.participantName, { id: info.id, name: info.name })
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -346,7 +346,7 @@ export const register: Register = (on, options) => {
       const fetch = makeFetch($, c)
       const result = await leaveRoom(fetch, e.room_id as string)
       await removeJoinedRoom($, c.participantName, e.room_id as string)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -362,7 +362,7 @@ export const register: Register = (on, options) => {
         hop_limit: e.hop_limit as number | undefined,
       })
       await addJoinedRoom($, c.participantName, { id: (result as any).room_id, name: e.name as string })
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -372,7 +372,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await inviteToRoom(fetch, e.room_id as string, e.invitee as string)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -382,7 +382,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await setTopic(fetch, e.room_id as string, e.topic as string)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -392,7 +392,7 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, creds(options))
       const result = await resumeRoom(fetch, e.room_id as string, e.granted_hops as number | undefined)
-      return { result }
+      return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
@@ -404,7 +404,7 @@ export const register: Register = (on, options) => {
       const fetch = makeFetch($, c)
       const joined = await getJoinedRooms($, c.participantName)
       const all = await listRooms(fetch)
-      return { result: { joined, all: (all as any).rooms } }
+      return { result: JSON.stringify({ joined, all: (all as any).rooms }, null, 2) }
     } catch (err) {
       return errorResult(err)
     }
