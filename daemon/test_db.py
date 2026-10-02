@@ -101,7 +101,7 @@ def main():
         check("old token invalidated after rotation", not _can_auth(conn, "Teddy", teddy_tok))
         teddy_tok = new_teddy_tok
 
-        room_id = db.create_room(conn, "lobby", "Teddy", teddy_tok, hop_limit=3)
+        room_id = db.create_room(conn, "testroom", "Teddy", teddy_tok, hop_limit=3)
 
         # --- closed rooms actually gate joining (not just advertise it) ---
         try:
@@ -318,7 +318,7 @@ def main():
               qualia_rooms[room_id]["unread"] >= 0)  # sanity: never negative
 
         # --- list_participants ---
-        names = {p["name"]: p["kind"] for p in db.list_participants(conn)}
+        names = {p["name"]: p["kind"] for p in db.list_participants(conn, "Teddy")}
         check("list_participants includes Teddy as human", names.get("Teddy") == "human")
         check("list_participants includes Qualia as ai", names.get("Qualia") == "ai")
 
@@ -370,6 +370,66 @@ def main():
             check("archived room rejects sends", False)
         except db.HaikuError:
             check("archived room rejects sends", True)
+
+        # --- lobby (spec "The lobby") ---
+        lobby = db._lobby_row(conn)
+        check("lobby exists after the first human registered", lobby is not None)
+        lobby_id = lobby["id"]
+        check("lobby is open", lobby["mode"] == "open")
+        roster = {x["participant"]: x["status"] for x in db.room_roster(conn, lobby_id)}
+        check("Teddy is a lobby member from the start", roster.get("Teddy") == "present")
+        check("no AI was auto-joined to the lobby", not any(n in roster for n in ("Qualia", "Vero", "Out")))
+        check("ensure_lobby is idempotent (same id, no duplicate room)",
+              db.ensure_lobby(conn) == lobby_id
+              and conn.execute("SELECT COUNT(*) FROM rooms WHERE name = 'lobby'").fetchone()[0] == 1)
+        check("lobby_info reports it without joining", db.lobby_info(conn)["joined"] is False)
+        try:
+            db.create_room(conn, "Lobby", "Qualia", qualia_tok)
+            check("creating a room named lobby (any case) is rejected", False)
+        except db.HaikuError:
+            check("creating a room named lobby (any case) is rejected", True)
+        try:
+            db.archive_room(conn, lobby_id, "Teddy", teddy_tok)
+            check("the lobby cannot be archived", False)
+        except db.HaikuError:
+            check("the lobby cannot be archived", True)
+        check("lobby still active after the failed archive", db._get_room(conn, lobby_id)["state"] == "active")
+        # An AI joins explicitly, like any room (open room: no invite needed).
+        db.join_room(conn, lobby_id, "Out", outsider_tok)
+        check("an AI can explicitly join the lobby", "Out" in {x["participant"] for x in db.room_roster(conn, lobby_id)})
+        # Teddy leaving is respected: ensure_lobby does not pull him back.
+        db.leave_room(conn, lobby_id, "Teddy", teddy_tok)
+        db.ensure_lobby(conn)
+        check("a human who left the lobby is not re-joined",
+              {x["participant"]: x["status"] for x in db.room_roster(conn, lobby_id)}.get("Teddy") == "left")
+        db.join_room(conn, lobby_id, "Teddy", teddy_tok)
+        db.leave_room(conn, lobby_id, "Out", outsider_tok)
+
+        # --- caller-scoped list_participants ---
+        everyone = {p["name"] for p in db.list_participants(conn, "Teddy")}
+        check("human sees every registered participant", {"Teddy", "Qualia", "Vero", "Out"} <= everyone)
+        iso_tok = db.register_ai(conn, "Isolated")
+        check("an AI sharing no room sees nobody", db.list_participants(conn, "Isolated") == [])
+        vis = db.list_participants(conn, "Qualia")
+        check("AI view never includes itself", all(p["name"] != "Qualia" for p in vis))
+        check("AI view carries names and kinds only", all(set(p) == {"name", "kind"} for p in vis))
+        check("AI does not see a participant it shares no room with", "Isolated" not in {p["name"] for p in vis})
+        # Put Isolated in the lobby with Teddy only: sees Teddy, not Qualia/Vero.
+        db.join_room(conn, lobby_id, "Isolated", iso_tok)
+        seen = {p["name"] for p in db.list_participants(conn, "Isolated")}
+        check("after joining the lobby, an AI sees exactly its lobby-mates", seen == {"Teddy"})
+        db.leave_room(conn, lobby_id, "Isolated", iso_tok)
+        check("leaving the room hides its members again", db.list_participants(conn, "Isolated") == [])
+
+        # --- pending invites ---
+        inv_room = db.create_room(conn, "invite-test", "Teddy", teddy_tok)
+        check("no pending invites before being invited", db.list_pending_invites(conn, "Isolated") == [])
+        db.invite(conn, inv_room, "Teddy", teddy_tok, "Isolated")
+        pend = db.list_pending_invites(conn, "Isolated")
+        check("pending invite carries room_id, room_name, invited_by",
+              pend == [{"room_id": inv_room, "room_name": "invite-test", "invited_by": "Teddy"}])
+        db.join_room(conn, inv_room, "Isolated", iso_tok)
+        check("joining consumes the pending invite", db.list_pending_invites(conn, "Isolated") == [])
 
         print("\nALL CHECKS PASSED")
     finally:

@@ -158,7 +158,7 @@ def main():
         check("schema version after connect() is current",
               conn.execute("PRAGMA user_version").fetchone()[0] == db.CURRENT_SCHEMA_VERSION)
 
-        row_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        row_count = conn.execute("SELECT COUNT(*) FROM events WHERE room_id = 'r1'").fetchone()[0]
         check("the pre-existing event row survived the migration", row_count == 1)
         surviving = conn.execute(
             "SELECT author, type FROM events WHERE room_id='r1' AND seq=1"
@@ -172,6 +172,14 @@ def main():
         db.archive_room(conn, "r1", "AdminTest", token)
         check("archive works after migration (the bug this prevents)",
               dict(db._get_room(conn, "r1"))["state"] == "archived")
+
+        # The lobby needs no schema change; connect() must still give a
+        # pre-lobby db one, with its existing human ('Teddy') as a member.
+        lobby = db._lobby_row(conn)
+        check("a pre-lobby db gets a lobby on connect()", lobby is not None)
+        check("the existing human is a lobby member after migration",
+              conn.execute("SELECT status FROM roster WHERE room_id = ? AND participant = 'Teddy'",
+                           (lobby["id"],)).fetchone()["status"] == "present")
 
         check("a backup file was made before migrating", os.path.exists(f"{DBFILE}.backup-before-migration-v1-to-v{db.CURRENT_SCHEMA_VERSION}"))
 

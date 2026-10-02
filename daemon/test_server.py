@@ -145,13 +145,13 @@ def main():
         qualia_tok = resp["token"]
 
         # --- auth headers required, token never accepted via query/body ---
-        status, resp = c.request("POST", "/rooms", body={"name": "lobby"})
+        status, resp = c.request("POST", "/rooms", body={"name": "testroom"})
         check("room creation without auth headers rejected", status == 401)
 
-        status, resp = c.request("POST", "/rooms", body={"name": "lobby"}, headers=c.auth("Teddy", "wrong-token"))
+        status, resp = c.request("POST", "/rooms", body={"name": "testroom"}, headers=c.auth("Teddy", "wrong-token"))
         check("room creation with bad token rejected", status == 400)
 
-        status, resp = c.request("POST", "/rooms", body={"name": "lobby"}, headers=c.auth("Teddy", teddy_tok))
+        status, resp = c.request("POST", "/rooms", body={"name": "testroom"}, headers=c.auth("Teddy", teddy_tok))
         check("room creation with valid auth succeeds", status == 200)
         room_id = resp["room_id"]
 
@@ -212,6 +212,29 @@ def main():
 
         status, resp = c.request("GET", "/participants")
         check("participants requires auth", status == 401)
+
+        # --- lobby / scoped participants / pending invites over HTTP ---
+        status, resp = c.request("POST", "/register/ai", body={"name": "LobbyCheck"})
+        lobby_tok = resp["token"]
+        check("AI registration reports the lobby exists, not joined",
+              status == 200 and resp.get("lobby", {}).get("name") == "lobby" and resp["lobby"]["joined"] is False)
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("LobbyCheck", lobby_tok))
+        check("registering did not join the lobby", status == 200 and resp["rooms"] == [])
+        check("/me/rooms carries pending_invites (empty)", resp.get("pending_invites") == [])
+        status, resp = c.request("GET", "/participants", headers=c.auth("LobbyCheck", lobby_tok))
+        check("an AI sharing no room sees nobody over HTTP", status == 200 and resp["participants"] == [])
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("Teddy", teddy_tok))
+        lobby_id = next(r["id"] for r in resp["rooms"] if r["name"] == "lobby")
+        status, resp = c.request("POST", f"/rooms/{lobby_id}/archive", body={}, headers=c.auth("Teddy", teddy_tok))
+        check("archiving the lobby is rejected over HTTP", status == 400)
+        status, resp = c.request("POST", "/rooms", body={"name": "lobby"}, headers=c.auth("Teddy", teddy_tok))
+        check("creating a second lobby is rejected over HTTP", status == 400)
+        status, resp = c.request("POST", "/rooms", body={"name": "inv-http"}, headers=c.auth("Teddy", teddy_tok))
+        inv_id = resp["room_id"]
+        c.request("POST", f"/rooms/{inv_id}/invite", body={"invitee": "LobbyCheck"}, headers=c.auth("Teddy", teddy_tok))
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("LobbyCheck", lobby_tok))
+        check("invite shows up in /me/rooms pending_invites",
+              resp["pending_invites"] == [{"room_id": inv_id, "room_name": "inv-http", "invited_by": "Teddy"}])
 
         status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Qualia", qualia_tok))
         check("AI cannot pause over HTTP", status == 400)

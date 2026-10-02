@@ -98,6 +98,61 @@ def _migrate(conn, db_path, existed_before: bool):
             conn.execute(f"PRAGMA user_version = {v}")
 
 
+LOBBY_NAME = "lobby"
+
+
+def _lobby_row(conn):
+    return conn.execute(
+        "SELECT * FROM rooms WHERE name = ? COLLATE NOCASE", (LOBBY_NAME,)
+    ).fetchone()
+
+
+def ensure_lobby(conn) -> str | None:
+    """docs/haiku-room-spec.md "The lobby": the daemon owns a room named
+    `lobby`; every human is a member from the start; it can't be archived;
+    the hop cap applies like any room. AIs are NEVER auto-joined — joining
+    stays the same explicit call as any room.
+
+    Idempotent, and safe to call on every connect() and after every human
+    registration, so it also covers a db that predates the lobby (it needs
+    no schema change, just this call). rooms.created_by must reference a
+    real participant, so on a brand-new db the lobby can't exist until the
+    first human does; register_human calls this to create it then. A human
+    who later LEFT the lobby has a roster row (status 'left') and is not
+    pulled back in — only humans with no roster row at all are joined.
+    Returns the lobby's room id, or None if it can't exist yet."""
+    with _transaction(conn):
+        room = _lobby_row(conn)
+        if room is None:
+            first = conn.execute(
+                "SELECT name FROM participants WHERE kind = 'human' ORDER BY created_at, name LIMIT 1"
+            ).fetchone()
+            if first is None:
+                return None
+            room_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO rooms (id, name, topic, created_by, mode)
+                   VALUES (?, ?, ?, ?, 'open')""",
+                (room_id, LOBBY_NAME,
+                 "Announcements, who's online, and finding each other", first["name"]),
+            )
+        else:
+            room_id = room["id"]
+        for h in conn.execute("SELECT name FROM participants WHERE kind = 'human'").fetchall():
+            if not _was_ever_member(conn, room_id, h["name"]):
+                _join(conn, room_id, h["name"])
+    return room_id
+
+
+def lobby_info(conn) -> dict | None:
+    """What registration tells a new participant: the lobby exists and how
+    to find it. Never joins anyone."""
+    room = _lobby_row(conn)
+    if room is None:
+        return None
+    return {"room_id": room["id"], "name": room["name"], "joined": False}
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, isolation_level=None)  # manual tx control, see _transaction
     conn.row_factory = sqlite3.Row
@@ -108,6 +163,7 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.executescript(SCHEMA_PATH.read_text())
     _migrate(conn, db_path, existed_before)
     _ensure_admin_secret(conn, db_path)
+    ensure_lobby(conn)
     return conn
 
 
@@ -227,6 +283,7 @@ def register_human(conn, name: str, admin_secret: str, address: str | None = Non
             "INSERT INTO participants (name, kind, address, token_hash) VALUES (?, 'human', ?, ?)",
             (name, address, _hash_token(token)),
         )
+    ensure_lobby(conn)
     return token
 
 
@@ -278,6 +335,8 @@ def create_room(conn, name: str, created_by: str, token: str, topic: str | None 
                  mode: str = "closed", hop_limit: int = 6) -> str:
     authenticate(conn, created_by, token)
     _validate_display_name(name)
+    if name.lower() == LOBBY_NAME:
+        raise HaikuError(f"'{LOBBY_NAME}' is reserved for the daemon's own lobby room")
     room_id = str(uuid.uuid4())
     with _transaction(conn):
         conn.execute(
@@ -573,6 +632,8 @@ def archive_room(conn, room_id: str, archived_by: str, token: str) -> None:
     if kind != "human":
         raise HaikuError("only a human can archive a room")
     room = _get_room(conn, room_id)
+    if room["name"].lower() == LOBBY_NAME:
+        raise HaikuError("the lobby cannot be archived")
     if room["state"] == "archived":
         raise HaikuError("room is already archived")
     with _transaction(conn):
@@ -691,9 +752,42 @@ def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
     return result
 
 
-def list_participants(conn) -> list[dict]:
-    """ui-spec.md §7.4: names + kinds only, for the invite picker."""
-    rows = conn.execute("SELECT name, kind FROM participants ORDER BY name").fetchall()
+def list_participants(conn, caller: str) -> list[dict]:
+    """ui-spec.md "Decisions": scoped by caller. A human (the admin, Teddy)
+    sees every registered name and kind. An AI sees only participants who
+    currently share at least one room with it (both not 'left'), and never
+    which rooms: names + kinds only, never the caller itself. An AI that
+    shares no room with anyone gets an empty list. `caller` must already
+    be authenticated by whoever calls this."""
+    row = conn.execute("SELECT kind FROM participants WHERE name = ?", (caller,)).fetchone()
+    if row is None:
+        raise HaikuError("invalid credentials")
+    if row["kind"] == "human":
+        rows = conn.execute("SELECT name, kind FROM participants ORDER BY name").fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT DISTINCT p.name, p.kind FROM participants p
+               JOIN roster other ON other.participant = p.name AND other.status != 'left'
+               JOIN roster mine ON mine.room_id = other.room_id
+                                AND mine.participant = ? AND mine.status != 'left'
+               WHERE p.name != ?
+               ORDER BY p.name""",
+            (caller, caller),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_pending_invites(conn, participant: str) -> list[dict]:
+    """Standing invites for `participant`; consumed on join, so this is
+    exactly "invited, not yet joined". The room name is what the invite
+    itself offers; no room contents or roster are exposed."""
+    rows = conn.execute(
+        """SELECT i.room_id, rm.name AS room_name, i.invited_by
+           FROM invites i JOIN rooms rm ON rm.id = i.room_id
+           WHERE i.participant = ? AND rm.state != 'archived'
+           ORDER BY i.created_at""",
+        (participant,),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

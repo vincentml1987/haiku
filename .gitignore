@@ -22,3 +22,4 @@ plugin/tsconfig.json
 # Editor/OS cruft
 .DS_Store
 Thumbs.db
+daemon/*.log

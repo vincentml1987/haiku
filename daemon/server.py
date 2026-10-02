@@ -94,7 +94,12 @@ def _admin_header(headers):
 @route("POST", r"/register/ai")
 def h_register_ai(conn, params, body, headers):
     token = db.register_ai(conn, body["name"], address=body.get("address"))
-    return {"token": token}
+    resp = {"token": token}
+    lobby = db.lobby_info(conn)
+    if lobby is not None:
+        # Informational only: registration never joins anyone (spec: no auto-join).
+        resp["lobby"] = lobby
+    return resp
 
 
 @route("POST", r"/register/human")
@@ -211,14 +216,15 @@ def h_ack(conn, params, body, headers, room_id):
 @route("GET", r"/me/rooms")
 def h_my_rooms(conn, params, body, headers):
     participant, token = _auth_headers(headers)
-    return {"rooms": db.list_my_rooms(conn, participant, token)}
+    rooms = db.list_my_rooms(conn, participant, token)
+    return {"rooms": rooms, "pending_invites": db.list_pending_invites(conn, participant)}
 
 
 @route("GET", r"/participants")
 def h_participants(conn, params, body, headers):
     participant, token = _auth_headers(headers)
     db.authenticate(conn, participant, token)
-    return {"participants": db.list_participants(conn)}
+    return {"participants": db.list_participants(conn, participant)}
 
 
 @route("POST", f"/rooms/{ROOM_ID}/pause")
