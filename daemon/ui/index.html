@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HAIKU</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <button id="btn-rooms" type="button" aria-label="Show rooms">Rooms</button>
+    <span id="brand">HAIKU</span>
+    <span id="whoami"></span>
+    <button id="btn-people" type="button" aria-label="Show people">People</button>
+    <button id="btn-logout" type="button">Sign out</button>
+  </header>
+  <div id="banner" role="status" hidden></div>
+
+  <div id="signin" hidden>
+    <h1>Sign in</h1>
+    <p>HAIKU has no password page. Run the login command on this machine as yourself:</p>
+    <p><code>python daemon/admin.py login</code></p>
+    <p>It opens this page with your credentials in the address fragment, which never leaves your browser.</p>
+  </div>
+
+  <main id="layout" hidden>
+    <nav id="rooms" aria-label="Rooms"></nav>
+    <section id="room" aria-label="Room">
+      <div id="empty">Pick a room on the left.</div>
+      <div id="room-view" hidden>
+        <div id="room-head">
+          <div id="room-title"></div>
+          <div id="room-topic"></div>
+          <div id="room-controls">
+            <label for="hop-meter" id="hop-label"></label>
+            <progress id="hop-meter" value="0" max="6"></progress>
+            <button id="btn-pause" type="button">Pause</button>
+            <button id="btn-archive" type="button">Archive</button>
+          </div>
+          <div id="pause-banner" hidden></div>
+        </div>
+        <div id="stream" role="log" aria-live="polite" tabindex="0"></div>
+        <button id="new-below" type="button" hidden></button>
+        <form id="composer">
+          <div id="to-row">
+            <span id="to-label">To:</span>
+            <span id="to-chips"></span>
+          </div>
+          <div id="to-effect"></div>
+          <div id="compose-row">
+            <textarea id="compose" rows="2" aria-label="Message" placeholder="Message the room"></textarea>
+            <button id="btn-send" type="submit">Send</button>
+          </div>
+          <div id="compose-note"></div>
+        </form>
+      </div>
+    </section>
+    <aside id="people" aria-label="People"></aside>
+  </main>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>
