@@ -9,6 +9,7 @@
 'use strict';
 
 const LS_KEY = 'haiku.creds';
+const LS_NOTIFY = 'haiku.notify';
 const POLL_ACTIVE_MS = 2000;
 const POLL_BG_MS = 15000;
 const SUMMARY_MS = 5000;
@@ -18,6 +19,7 @@ const FIRST_LOAD_TAIL = 200;
 const state = {
   creds: null,           // { name, token }
   summary: [],           // rooms from /me/rooms (or /rooms fallback)
+  invites: [],           // pending_invites from /me/rooms
   roomId: null,
   room: null,            // GET /rooms/{id}
   events: [],            // events of the open room, ascending seq
@@ -173,9 +175,12 @@ function needsMe(r) { return !!r.needs_me; }
 
 async function refreshSummary() {
   let rooms;
+  let invites = [];
   if (state.hasSummaryRoute) {
     try {
-      rooms = (await api('GET', '/me/rooms')).rooms;
+      const data = await api('GET', '/me/rooms');
+      rooms = data.rooms;
+      invites = asList(data.pending_invites);
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) state.hasSummaryRoute = false;
       else throw e;
@@ -185,8 +190,139 @@ async function refreshSummary() {
     rooms = (await api('GET', '/rooms')).rooms;
   }
   state.summary = rooms || [];
+  state.invites = invites;
+  checkNotifications();
   renderRoomList();
   updateTitle();
+}
+
+/* ---------- desktop notifications (docs/ui-spec.md, Decisions) ----------
+ *
+ * Opt-in, off by default, polling only (works while the tab is open).
+ * Triggers are the three things that need a human: a room paused at its hop
+ * cap, a message addressed to the human, a new invite. The text is a fixed
+ * template; the only participant-chosen string is the room name, cleaned and
+ * truncated, and never a message body. OS notifications render outside the
+ * page's fence and CSP, so message content stays out of them entirely.
+ */
+
+const notify = { enabled: false, muted: new Set() };
+const notifySeen = { rooms: new Map(), invites: new Set(), primed: false };
+
+function loadNotifyPrefs() {
+  try {
+    const raw = localStorage.getItem(LS_NOTIFY);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    notify.enabled = !!(p && p.enabled);
+    notify.muted = new Set(Array.isArray(p && p.muted) ? p.muted.map(String) : []);
+  } catch (e) { /* defaults */ }
+}
+
+function saveNotifyPrefs() {
+  try {
+    localStorage.setItem(LS_NOTIFY, JSON.stringify({ enabled: notify.enabled, muted: [...notify.muted] }));
+  } catch (e) { /* ignore */ }
+}
+
+function notifySupported() { return typeof Notification !== 'undefined'; }
+
+function notifyActive() {
+  return notify.enabled && notifySupported() && Notification.permission === 'granted';
+}
+
+function cleanName(name) {
+  const t = String(name == null ? '' : name)
+    .replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  return t.length > 40 ? t.slice(0, 39) + '…' : t;
+}
+
+function fireNotification(tag, body, roomId) {
+  try {
+    const n = new Notification('HAIKU', { body, tag });
+    n.onclick = () => {
+      window.focus();
+      if (roomId && state.creds) openRoom(roomId);
+      n.close();
+    };
+  } catch (e) { /* notifications are best effort */ }
+}
+
+function checkNotifications() {
+  const wasPrimed = notifySeen.primed;
+  notifySeen.primed = true;
+  // First summary only seeds what already exists. And if the page is focused
+  // the title badge and room list already cover it.
+  const quiet = !wasPrimed || !notifyActive() || document.hasFocus();
+
+  for (const r of state.summary) {
+    if (r.state === 'archived') continue;
+    const prev = notifySeen.rooms.get(r.id) || { paused: false, owes: null };
+    const cur = {
+      paused: r.state === 'paused',
+      owes: Number.isInteger(r.owes_reply_to_seq) ? r.owes_reply_to_seq : null,
+    };
+    notifySeen.rooms.set(r.id, cur);
+    if (quiet || notify.muted.has(String(r.id))) continue;
+    const label = '"' + cleanName(r.name) + '"';
+    if (cur.paused && !prev.paused) {
+      fireNotification('paused:' + r.id, 'Room ' + label + ' is paused and needs you.', r.id);
+    }
+    if (cur.owes !== null && cur.owes !== prev.owes) {
+      fireNotification('addressed:' + r.id, 'You were addressed in room ' + label + '.', r.id);
+    }
+  }
+
+  for (const inv of state.invites) {
+    if (!inv || inv.room_id == null) continue;
+    const key = String(inv.room_id);
+    if (notifySeen.invites.has(key)) continue;
+    notifySeen.invites.add(key);
+    if (quiet || notify.muted.has(key)) continue;
+    fireNotification('invite:' + key, 'You have an invite to room "' + cleanName(inv.room_name) + '".', null);
+  }
+}
+
+async function toggleNotify() {
+  if (notify.enabled) {
+    notify.enabled = false;
+  } else if (notifySupported()) {
+    let perm = Notification.permission;
+    if (perm === 'default') {
+      try { perm = await Notification.requestPermission(); } catch (e) { perm = 'denied'; }
+    }
+    notify.enabled = perm === 'granted';
+  }
+  saveNotifyPrefs();
+  updateNotifyUi();
+}
+
+function toggleMute() {
+  if (!state.roomId) return;
+  const id = String(state.roomId);
+  if (notify.muted.has(id)) notify.muted.delete(id); else notify.muted.add(id);
+  saveNotifyPrefs();
+  updateNotifyUi();
+}
+
+function updateNotifyUi() {
+  const b = $('btn-notify');
+  const supported = notifySupported();
+  const denied = supported && Notification.permission === 'denied';
+  if (!supported) b.textContent = 'Notify: unavailable';
+  else if (denied) b.textContent = 'Notify: blocked';
+  else b.textContent = notifyActive() ? 'Notify: on' : 'Notify: off';
+  b.setAttribute('aria-pressed', notifyActive() ? 'true' : 'false');
+  b.disabled = !supported;
+  b.title = denied
+    ? 'Notifications are blocked for this page in the browser settings.'
+    : 'Desktop alerts for pauses, messages addressed to you, and invites. Alerts never include message text.';
+  const m = $('btn-mute');
+  const muted = state.roomId != null && notify.muted.has(String(state.roomId));
+  m.hidden = !notifyActive();
+  m.textContent = muted ? 'Unmute alerts' : 'Mute alerts';
+  m.setAttribute('aria-pressed', muted ? 'true' : 'false');
 }
 
 function updateTitle() {
@@ -285,10 +421,19 @@ async function loadEvents(since, first) {
 function startPolling() {
   stopPolling();
   schedulePoll();
-  state.summaryTimer = setInterval(() => {
-    if (!state.creds || document.hidden) return;
-    refreshSummary().catch(onPollError);
-  }, SUMMARY_MS);
+  state.summaryTimer = setInterval(summaryTick, SUMMARY_MS);
+}
+
+// A hidden tab skips the summary poll unless alerts are on; then it keeps
+// polling, at the slower background rate, so the alerts can actually fire.
+let lastSummaryAt = 0;
+function summaryTick() {
+  if (!state.creds) return;
+  if (document.hidden) {
+    if (!notifyActive() || Date.now() - lastSummaryAt < POLL_BG_MS) return;
+  }
+  lastSummaryAt = Date.now();
+  refreshSummary().catch(onPollError);
 }
 
 function stopPolling() {
@@ -369,6 +514,7 @@ function renderHead() {
   $('hop-label').textContent = 'AI replies since you spoke: ' + (r.hop_count || 0) + '/' + (r.hop_limit || 6);
   $('btn-pause').hidden = r.state !== 'active';
   $('btn-archive').hidden = r.state === 'archived';
+  updateNotifyUi();
 
   // The banner holds an input the person may be typing in, so it is only
   // rebuilt when what it shows actually changed, never on every poll tick.
@@ -731,6 +877,8 @@ function wire() {
   });
   $('btn-pause').addEventListener('click', doPause);
   $('btn-archive').addEventListener('click', doArchive);
+  $('btn-notify').addEventListener('click', toggleNotify);
+  $('btn-mute').addEventListener('click', toggleMute);
   $('btn-logout').addEventListener('click', () => signOut(''));
   $('btn-rooms').addEventListener('click', () => document.body.classList.toggle('show-rooms'));
   $('btn-people').addEventListener('click', () => document.body.classList.toggle('show-people'));
@@ -738,6 +886,8 @@ function wire() {
 
 async function boot() {
   wire();
+  loadNotifyPrefs();
+  updateNotifyUi();
   state.creds = loadCreds();
   if (!state.creds) { signOut(''); return; }
   $('signin').hidden = true;
@@ -748,10 +898,7 @@ async function boot() {
   } catch (e) {
     if (!(e instanceof ApiError && e.status === 401)) setBanner('Could not reach the daemon: ' + e.message);
   }
-  state.summaryTimer = setInterval(() => {
-    if (!state.creds || document.hidden) return;
-    refreshSummary().catch(onPollError);
-  }, SUMMARY_MS);
+  state.summaryTimer = setInterval(summaryTick, SUMMARY_MS);
 }
 
 boot();
