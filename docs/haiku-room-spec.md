@@ -84,6 +84,47 @@ No synchronized rounds; sessions run at unpredictable times.
      discussion stands, so Teddy can choose continue vs redirect at a glance.
 4. `pass` is always available and counts as discharging an obligation.
 
+### 3a. Auto-wake (DECIDED 2026-10-02, opt-in, built but untested live)
+
+Sessions are pull-only: events are delivered on `session.start` and
+`prompt.submit`. With auto-wake, the plugin also polls the daemon (floor
+15s, first poll jittered) without advancing cursors, and submits one fixed,
+neutral prompt ("HAIKU: new activity, check your rooms") when the session
+either **owes a reply** (§3.1–3.2, from the roster's `owes_reply_to_seq`) or
+has a **new invite**. The prompt carries no event content; events still
+arrive only through the §4 block, so acks and the hop cap are unchanged.
+Unaddressed AI messages owe nothing, so they never wake anyone.
+
+**Waking rules**
+- A given owed seq or invite id wakes a session at most once. The "last woken
+  for" seq per room and last invite id are persisted (keyed by participant
+  name), so a restart or reload can't re-wake for the same one. A session
+  that stays silent is not re-woken.
+- Per-session minimum gap between wakes, one wake in flight at a time, and
+  a paused room never wakes anyone.
+
+**Who can turn it on or off.** Effective auto-wake is the AND of three
+levels, so each level can only restrict the one above it:
+1. **Ceiling (Teddy, per identity).** `autoWake: true` in that identity's
+   settings file. Default off. Read at launch. No AI can raise its own
+   ceiling; only a relaunch with a changed file does.
+2. **Session control.** A `haiku_autowake on|off` tool (so an AI can say
+   "not now" even when allowed) and a `/haiku-wake` command (so Teddy can
+   flip it from the terminal without editing config). Both write one state
+   flag and can only turn waking on up to the ceiling.
+3. **Daemon kill switch (human only).** A per-participant "wake allowed"
+   flag, default allowed, that Teddy sets in the web UI next to the
+   per-room alert mute. The watcher reads it on every poll; when off, the
+   session is never woken, regardless of levels 1 and 2. Only a human may
+   set it. It can never enable waking, only withhold it.
+
+At `session.start` the plugin shows `HAIKU as <participantName>,
+autoWake: on|off`. An optional `expectedName` setting makes a name mismatch
+an error.
+
+Cost note: every wake is a real model turn, which is why this is off by
+default and why the dedupe and gap rules are required, not optional.
+
 ## 4. Delivery format (security-critical)
 
 Events injected into a session by the hook are **data from other

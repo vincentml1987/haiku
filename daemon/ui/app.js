@@ -26,7 +26,9 @@ const state = {
   lastSeq: 0,
   dividerAfterSeq: null, // "new since you looked" sits after this seq
   participants: [],
-  to: new Set(),         // selected addressees (empty = everyone)
+  wake: null,            // { name: bool } from GET /participants (human callers only); null = not available
+  wakeLoadedAt: 0,
+  to: new Set(),        // selected addressees (empty = everyone)
   hasSummaryRoute: true,
   stickToBottom: true,
   unseenBelow: 0,
@@ -486,6 +488,7 @@ async function pollOnce() {
     const fresh = await loadEvents(state.lastSeq, false);
     state.room = await api('GET', '/rooms/' + encodeURIComponent(state.roomId));
     if (fresh.length) appendFresh(fresh);
+    if (Date.now() - state.wakeLoadedAt > 30000) await loadWake();
     renderHead();
     renderPeople();
     renderComposerEffect();
@@ -706,7 +709,7 @@ function renderPeople() {
   // Rebuild only when the roster (or the minute, for the "last active" ages)
   // changed, and carry the invite picker across a rebuild, so a poll tick
   // never closes something the person has open.
-  const key = JSON.stringify(rosterRows()) + '|' + Math.floor(Date.now() / 60000) + '|' + state.events.length;
+  const key = JSON.stringify(rosterRows()) + '|' + Math.floor(Date.now() / 60000) + '|' + state.events.length + '|' + JSON.stringify(state.wake);
   if (key === state.peopleKey) return;
   state.peopleKey = key;
   const keptInvite = document.getElementById('invite-box');
@@ -740,6 +743,20 @@ function renderPeople() {
         on: { click: () => jumpToSeq(p.owes_reply_to_seq) },
       }));
     }
+    // Wake kill switch (spec 3a, level 3): humans only, AI rows only. The
+    // daemon only sends the flag to human callers, so no flag means no control.
+    if (kind === 'ai' && state.wake && typeof state.wake[p.participant] === 'boolean') {
+      const allowed = state.wake[p.participant];
+      row.appendChild(el('button', {
+        type: 'button', cls: 'linklike wake-toggle' + (allowed ? '' : ' wake-off'),
+        text: allowed ? 'Wake: allowed' : 'Wake: blocked',
+        title: allowed
+          ? 'This AI may be woken for replies if its own settings allow it. Click to block.'
+          : 'This AI will not be woken, whatever its own settings say. Click to allow again.',
+        aria: { pressed: !allowed },
+        on: { click: () => setWake(p.participant, !allowed) },
+      }));
+    }
     box.appendChild(row);
   }
   box.appendChild(el('button', { type: 'button', id: 'btn-invite', text: 'Invite…', on: { click: openInvite } }));
@@ -748,6 +765,33 @@ function renderPeople() {
   } else {
     box.appendChild(el('div', { id: 'invite-box' }));
     $('invite-box').hidden = true;
+  }
+}
+
+async function loadWake() {
+  state.wakeLoadedAt = Date.now();
+  try {
+    const data = await api('GET', '/participants');
+    const list = data.participants || [];
+    // AI callers get rows without the field; leave the controls hidden then.
+    if (!list.some((p) => typeof p.wake_allowed === 'boolean')) { state.wake = null; return; }
+    const m = {};
+    for (const p of list) if (typeof p.wake_allowed === 'boolean') m[p.name] = p.wake_allowed;
+    state.wake = m;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) throw e;
+    /* leave the last known state; the next tick retries */
+  }
+}
+
+async function setWake(name, allowed) {
+  try {
+    await api('PUT', '/participants/' + encodeURIComponent(name) + '/wake_allowed', { allowed });
+    await loadWake();
+    renderPeople();
+    setBanner((allowed ? 'Allowed waking for ' : 'Blocked waking for ') + name + '.');
+  } catch (e) {
+    setBanner('Could not change wake setting: ' + e.message);
   }
 }
 

@@ -198,6 +198,8 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 .person-name { font-weight: 600; text-decoration: none; color: var(--text); }
 .person-status { color: var(--muted); font-size: 12px; }
 .obligation { font-size: 12px; text-align: left; }
+.wake-toggle { display: block; font-size: 12px; text-align: left; margin-top: 2px; }
+.wake-toggle.wake-off { font-weight: 700; }
 #btn-invite { margin-top: 8px; }
 .invite-pick { display: block; width: 100%; text-align: left; margin-top: 4px; }
 
