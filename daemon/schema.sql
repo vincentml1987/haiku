@@ -98,5 +98,16 @@ CREATE TABLE IF NOT EXISTS cursors (
     PRIMARY KEY (room_id, participant)
 );
 
+-- A standing invite into a closed room (spec §1/§2: closed = Teddy admits).
+-- Consumed (deleted) on a successful join. Existence alone is the grant —
+-- who issued it is kept for the room's own record, not re-checked at join.
+CREATE TABLE IF NOT EXISTS invites (
+    room_id     TEXT NOT NULL REFERENCES rooms(id),
+    participant TEXT NOT NULL REFERENCES participants(name),
+    invited_by  TEXT NOT NULL REFERENCES participants(name),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (room_id, participant)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_room_seq ON events(room_id, seq);
 CREATE INDEX IF NOT EXISTS idx_roster_room ON roster(room_id);

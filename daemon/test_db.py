@@ -83,7 +83,31 @@ def main():
         teddy_tok = new_teddy_tok
 
         room_id = db.create_room(conn, "lobby", "Teddy", teddy_tok, hop_limit=3)
+
+        # --- closed rooms actually gate joining (not just advertise it) ---
+        try:
+            db.join_room(conn, room_id, "Qualia", qualia_tok)
+            check("uninvited join to closed room rejected", False)
+        except db.HaikuError:
+            check("uninvited join to closed room rejected", True)
+
+        try:
+            db.invite(conn, room_id, "Qualia", qualia_tok, "Vero")
+            check("non-member cannot invite", False)
+        except db.HaikuError:
+            check("non-member cannot invite", True)
+
+        db.invite(conn, room_id, "Teddy", teddy_tok, "Qualia")
         db.join_room(conn, room_id, "Qualia", qualia_tok)
+        check("invite consumed on join", not db._has_invite(conn, room_id, "Qualia"))
+
+        try:
+            db.invite(conn, room_id, "Qualia", qualia_tok, "Vero")
+            check("AI member cannot invite", False)
+        except db.HaikuError:
+            check("AI member cannot invite", True)
+
+        db.invite(conn, room_id, "Teddy", teddy_tok, "Vero")
         db.join_room(conn, room_id, "Vero", vero_tok)
 
         # --- auth ---
@@ -225,6 +249,7 @@ def main():
         for i in range(5):
             db.send_message(conn, room_id, "Teddy", teddy_tok, f"filler {i}", addressed_to=["all"])
         newcomer_tok = db.register_ai(conn, "Newcomer")
+        db.invite(conn, room_id, "Teddy", teddy_tok, "Newcomer")
         db.join_room(conn, room_id, "Newcomer", newcomer_tok, catch_up=2)
         first_read = db.read_events(conn, room_id, "Newcomer", newcomer_tok)
         check("catch_up window limits first read", len(first_read) == 2)
@@ -235,6 +260,11 @@ def main():
             check("AI cannot claim an existing name", False)
         except db.HaikuError:
             check("AI cannot claim an existing name", True)
+
+        # --- open rooms need no invite ---
+        open_room_id = db.create_room(conn, "open-room", "Teddy", teddy_tok, mode="open")
+        db.join_room(conn, open_room_id, "Out", outsider_tok)
+        check("open room join needs no invite", db._was_ever_member(conn, open_room_id, "Out"))
 
         # --- archived room rejects sends ---
         with db._transaction(conn):

@@ -242,20 +242,62 @@ def _join(conn, room_id, participant):
     )
 
 
+def _was_ever_member(conn, room_id: str, participant: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM roster WHERE room_id = ? AND participant = ?",
+        (room_id, participant),
+    ).fetchone() is not None
+
+
+def _has_invite(conn, room_id: str, participant: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM invites WHERE room_id = ? AND participant = ?",
+        (room_id, participant),
+    ).fetchone() is not None
+
+
+def invite(conn, room_id: str, inviter: str, token: str, invitee: str) -> None:
+    """Spec §1/§2: closed = Teddy admits. v1 rule: in a closed room, only
+    a present human MEMBER can invite (not just any human who knows the
+    room id)."""
+    kind = authenticate(conn, inviter, token)
+    _get_room(conn, room_id)
+    _require_member(conn, room_id, inviter)
+    if kind != "human":
+        raise HaikuError("only a human member can invite into a closed room")
+    with _transaction(conn):
+        conn.execute(
+            """INSERT INTO invites (room_id, participant, invited_by) VALUES (?, ?, ?)
+               ON CONFLICT(room_id, participant) DO UPDATE SET invited_by = excluded.invited_by""",
+            (room_id, invitee, inviter),
+        )
+
+
 def join_room(conn, room_id: str, participant: str, token: str,
               catch_up: int | None = None) -> None:
-    """Explicit join, per spec §2. `catch_up`: for a genuinely first-time
-    join, the cursor starts at (latest_seq - catch_up) instead of 0, so the
-    first read only surfaces the last N events. A rejoin ignores catch_up
-    and keeps the cursor it already has ("everything since it last left")."""
+    """Explicit join, per spec §2. A closed room requires the joiner be
+    its creator, a past member (rejoining), or holder of a standing
+    invite — otherwise this is the back door Vero's review found: any
+    locally-registered AI could join and read any closed room's log.
+    `catch_up`: for a genuinely first-time join, the cursor starts at
+    (latest_seq - catch_up) instead of 0, so the first read only surfaces
+    the last N events. A rejoin ignores catch_up and keeps the cursor it
+    already has ("everything since it last left")."""
     authenticate(conn, participant, token)
-    _get_room(conn, room_id)
+    room = _get_room(conn, room_id)
+    if room["mode"] == "closed" and participant != room["created_by"]:
+        if not (_was_ever_member(conn, room_id, participant) or _has_invite(conn, room_id, participant)):
+            raise HaikuError("room is closed; ask a human member to invite you")
     with _transaction(conn):
         had_cursor = conn.execute(
             "SELECT 1 FROM cursors WHERE room_id = ? AND participant = ?",
             (room_id, participant),
         ).fetchone() is not None
         _join(conn, room_id, participant)
+        conn.execute(
+            "DELETE FROM invites WHERE room_id = ? AND participant = ?",
+            (room_id, participant),
+        )
         if not had_cursor and catch_up is not None:
             latest = conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) AS n FROM events WHERE room_id = ?",
