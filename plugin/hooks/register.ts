@@ -53,9 +53,19 @@ function makeFetch($: Engine, c: HaikuCreds): HaikuFetch {
       'X-Haiku-Token': c.participantToken,
     }
     const init: { method: string; headers: Record<string, string>; body?: string } = { method, headers }
-    if (body !== undefined) {
+    // The daemon requires Content-Type: application/json on every POST,
+    // body or not (haiku_pass/haiku_leave send no body at all) — always
+    // set it and send at least "{}" for a non-GET, never only when a
+    // body happens to be given (Vero caught this live: haiku_pass and
+    // haiku_leave were going out with no Content-Type and being rejected).
+    // The daemon requires Content-Type: application/json on every POST,
+    // body or not (haiku_pass/haiku_leave send no body at all) — always
+    // set it and send at least "{}" for a non-GET, never only when a
+    // body happens to be given (Vero caught this live: haiku_pass and
+    // haiku_leave were going out with no Content-Type and being rejected).
+    if (method !== 'GET') {
       headers['Content-Type'] = 'application/json'
-      init.body = JSON.stringify(body)
+      init.body = JSON.stringify(body ?? {})
     }
     const res = await $.http.fetch(url, init)
     let parsed: any = {}
