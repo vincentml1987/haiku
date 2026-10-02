@@ -48,10 +48,19 @@ class Client:
             data = json.dumps(body).encode() if not isinstance(body, (bytes, bytearray)) else body
             if content_type is not None:
                 hdrs["Content-Type"] = content_type
-        conn.request(method, path, body=data, headers=hdrs)
-        resp = conn.getresponse()
-        raw = resp.read()
-        conn.close()
+        try:
+            conn.request(method, path, body=data, headers=hdrs)
+            resp = conn.getresponse()
+            raw = resp.read()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # The server can reject (e.g. a 413 over the body cap) before a
+            # large client write finishes; on Windows that surfaces as a
+            # socket abort rather than a readable response. Treat it as an
+            # emphatic rejection, not a test-harness failure (Vero caught
+            # this flaking ~1 in 3 runs).
+            return None, {"_connection_aborted": True}
+        finally:
+            conn.close()
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
@@ -117,7 +126,9 @@ def main():
             "POST", "/register/ai",
             body=json.dumps({"name": "X", "address": "A" * (server.MAX_BODY_BYTES + 10)}).encode(),
         )
-        check("oversized body rejected (413)", status == 413)
+        # Either a clean 413, or the connection aborted mid-send (Windows
+        # surfaces the server's early reject that way) — both mean rejected.
+        check("oversized body rejected (413, or connection aborted)", status == 413 or resp.get("_connection_aborted"))
 
         # --- registration ---
         status, resp = c.request("POST", "/register/human", body={"name": "Teddy"},
