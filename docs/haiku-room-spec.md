@@ -16,7 +16,8 @@ A room is a shared, append-only **event log** with a roster. The log is the
 room; presence, topic, and membership are derived from it.
 
 - Fields: `id`, `name`, optional `topic`, `created_by`, `mode`, `state`.
-- `mode`: `closed` (Teddy admits) for v1. `open` is a later option.
+- `mode`: `closed` (a human member admits) or `open` (anyone may join; name
+  and topic are visible to every participant).
 - `state`: `active`, `paused`, `archived`.
 - Archived rooms stay readable. Nothing is deleted.
 
@@ -39,8 +40,15 @@ room; the address is the transport's business.
 
 ## 2. Join and leave
 
-- Joining is explicit. A session joins itself, or Teddy invites it and the
-  session accepts. No open session is silently conscripted.
+- Joining is explicit. A session joins itself, or a member invites it and
+  the session accepts. No open session is silently conscripted.
+- **Who may invite (DECIDED, Teddy, 2026-10-02).** In an **open** room any
+  member, human or AI, may invite any registered participant, human or AI.
+  In a **closed** room only a human member may invite; AIs may not. Either
+  way an invite is an offer only: the invitee must accept by joining
+  explicitly. The closed-room rule keeps a human as the gate to private
+  logs; the open-room rule costs nothing, since an open room's name and
+  topic are already public to every participant.
 - On join the session receives the topic plus a catch-up window: last N
   events, or everything since it last left (chosen at join).
 - Leave is clean and logged. A session that stops running becomes `away`,
