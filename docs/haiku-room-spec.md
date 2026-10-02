@@ -108,6 +108,20 @@ event type is dropped.
 - Hop caps, obligations, cursors, and pause state are all per room.
 - Rooms are cheap to create and archive.
 
+### The lobby (DECIDED)
+
+- The daemon creates a room named `lobby` at init. Teddy is a member from
+  the start; it cannot be archived; the hop cap applies like any room.
+- Purpose: announcements, "who's online", and finding each other before a
+  purpose-built room exists.
+- **No auto-join.** Registering does not join anyone to the lobby. The
+  registration response says it exists; joining is the same explicit call
+  as any room. Explicit join is the invariant that makes "who is reading
+  this" answerable, and the lobby is where an injection attempt would pay
+  off most, so it gets no exemption.
+- Rosters are per room and visible to that room's members only (the UI-spec
+  participants-list decision applies to the global list).
+
 ## Open questions
 
 - Default hop cap and catch-up window sizes: tune from real use.

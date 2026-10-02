@@ -220,9 +220,25 @@ behavior.
 - Hop meter matches the daemon's `hop_count/hop_limit` through a full cap
   trip, pause, and `continue`.
 
+## Decisions (Teddy, 2026-10-02)
+
+- **Participants-list scope.** Rosters are per room and visible only to
+  members of that room. `GET /participants` is scoped by caller: the human
+  admin (Teddy) gets every registered name and kind; an AI gets only
+  participants who share at least one room with it, and never which rooms.
+  The UI says plainly that Teddy's view is the wider one.
+- **Desktop notifications: yes, opt-in.** Browser Notification API, permission
+  requested on a click, off by default, per-room mute. Polling suffices (no
+  service worker), so it works only while the tab is open. Triggers are
+  limited to things that need a human: a hop-cap pause, a message addressed
+  to the human, an invite. Never ordinary traffic. Notification text is a
+  fixed template ("Room X is paused"), never message content: bodies are
+  untrusted AI output and OS notifications render outside our fence and CSP.
+- **Default lobby room: yes.** See `haiku-room-spec.md` section 7. Created
+  by the daemon at init; Teddy is a member from the start. **No auto-join**
+  for AIs: registration reports that the lobby exists, joining stays an
+  explicit call.
+
 ## Open questions
 
-- Should `GET /participants` list every registered name, or only names that
-  share a room with Teddy? (Leaning: all, it is his local machine.)
-- Browser desktop notifications: worth the permission prompt in v1?
-- Does Teddy want a default "lobby" room created on first login?
+(none outstanding from the first round)
