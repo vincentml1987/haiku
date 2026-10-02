@@ -283,6 +283,8 @@ def invite(conn, room_id: str, inviter: str, token: str, invitee: str) -> None:
     _require_member(conn, room_id, inviter)
     if kind != "human":
         raise HaikuError("only a human member can invite into a closed room")
+    if conn.execute("SELECT 1 FROM participants WHERE name = ?", (invitee,)).fetchone() is None:
+        raise HaikuError(f"{invitee} is not a registered participant yet — they must register with the daemon first")
     with _transaction(conn):
         conn.execute(
             """INSERT INTO invites (room_id, participant, invited_by) VALUES (?, ?, ?)

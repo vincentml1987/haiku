@@ -294,6 +294,13 @@ def main():
         except db.HaikuError:
             check("AI cannot claim an existing name", True)
 
+        # --- inviting an unregistered name gives a clear error, not a raw FK crash ---
+        try:
+            db.invite(conn, room_id, "Teddy", teddy_tok, "Never Registered")
+            check("invite of unregistered name rejected cleanly", False)
+        except db.HaikuError:
+            check("invite of unregistered name rejected cleanly", True)
+
         # --- open rooms need no invite ---
         open_room_id = db.create_room(conn, "open-room", "Teddy", teddy_tok, mode="open")
         db.join_room(conn, open_room_id, "Out", outsider_tok)
