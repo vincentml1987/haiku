@@ -326,13 +326,29 @@ function updateNotifyUi() {
 }
 
 function updateTitle() {
-  const n = state.summary.filter((r) => r.state !== 'archived' && needsMe(r)).length;
+  const n = state.summary.filter((r) => r.state !== 'archived' && needsMe(r)).length + state.invites.length;
   document.title = (n ? '(' + n + ') ' : '') + 'HAIKU';
 }
 
 function renderRoomList() {
   const nav = $('rooms');
   clear(nav);
+  const invites = state.invites.filter((i) => i && i.room_id != null);
+  if (invites.length) {
+    nav.appendChild(el('h2', { text: 'Invites (' + invites.length + ')' }));
+    for (const inv of invites) {
+      nav.appendChild(el('div', { cls: 'invite-row' }, [
+        el('span', { cls: 'room-name', text: inv.room_name }),
+        el('button', {
+          type: 'button',
+          cls: 'invite-accept',
+          text: 'Accept',
+          title: 'Join this room. You see only its name and topic until you do.',
+          on: { click: (ev) => acceptInvite(inv.room_id, ev.currentTarget) },
+        }),
+      ]));
+    }
+  }
   const groups = [
     ['Needs you', (r) => r.state !== 'archived' && needsMe(r)],
     ['Active', (r) => r.state !== 'archived' && !needsMe(r)],
@@ -357,7 +373,19 @@ function renderRoomList() {
       nav.appendChild(btn);
     }
   }
-  if (!state.summary.length) nav.appendChild(el('p', { cls: 'muted', text: 'No rooms yet.' }));
+  if (!state.summary.length && !invites.length) nav.appendChild(el('p', { cls: 'muted', text: 'No rooms yet.' }));
+}
+
+async function acceptInvite(roomId, btn) {
+  btn.disabled = true;
+  try {
+    await api('POST', '/rooms/' + encodeURIComponent(roomId) + '/join', {});
+    await refreshSummary();
+    await openRoom(roomId);
+  } catch (e) {
+    btn.disabled = false;
+    if (!(e instanceof ApiError && e.status === 401)) setBanner('Could not join: ' + e.message);
+  }
 }
 
 /* ---------- opening a room ---------- */

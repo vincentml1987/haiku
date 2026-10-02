@@ -97,6 +97,10 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
   margin-bottom: 4px; text-align: left;
 }
 .room-row.current { border-color: var(--accent); }
+.invite-row {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+  padding: 4px 6px; border: 1px dashed var(--accent); border-radius: 6px;
+}
 .room-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .badge {
   background: var(--accent); color: var(--accent-text);
