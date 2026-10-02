@@ -190,6 +190,22 @@ def main():
         check("my_rooms exposes last_seq/my_cursor (the UI's field names)",
               "last_seq" in my_room and "my_cursor" in my_room)
 
+        # A participant who has joined but never read anything (no ack,
+        # no delivery yet): my_cursor must be a clean 0, not null/missing —
+        # the page's divider logic (Number.isInteger check) depends on this.
+        status, resp = c.request("POST", "/register/ai", body={"name": "NeverAcked"})
+        never_acked_tok = resp["token"]
+        status, resp = c.request(
+            "POST", f"/rooms/{room_id}/invite", body={"invitee": "NeverAcked"}, headers=c.auth("Teddy", teddy_tok)
+        )
+        check("invite NeverAcked succeeds", status == 200)
+        status, resp = c.request("POST", f"/rooms/{room_id}/join", body={}, headers=c.auth("NeverAcked", never_acked_tok))
+        check("NeverAcked join succeeds", status == 200)
+        status, resp = c.request("GET", "/me/rooms", headers=c.auth("NeverAcked", never_acked_tok))
+        never_room = next(r for r in resp["rooms"] if r["id"] == room_id)
+        check("never-acked participant has my_cursor == 0, not null", never_room["my_cursor"] == 0)
+        check("never-acked participant's unread equals the full last_seq", never_room["unread"] == never_room["last_seq"])
+
         status, resp = c.request("GET", "/participants", headers=c.auth("Teddy", teddy_tok))
         names = {p["name"]: p["kind"] for p in resp["participants"]}
         check("participants lists Teddy and Qualia with kinds", names.get("Teddy") == "human" and names.get("Qualia") == "ai")
@@ -199,6 +215,13 @@ def main():
 
         status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Qualia", qualia_tok))
         check("AI cannot pause over HTTP", status == 400)
+
+        # An AI token must never be able to pause/resume/archive, whatever
+        # state the room is in — a UI bug surfacing these controls to an AI
+        # must still hit a hard daemon-side wall (Vero's ask, after her e2e
+        # pass deliberately stopped short of exercising human-only flows).
+        status, resp = c.request("POST", f"/rooms/{room_id}/resume", body={}, headers=c.auth("Qualia", qualia_tok))
+        check("AI cannot resume over HTTP (even on an active, non-paused room)", status == 400)
 
         status, resp = c.request("POST", f"/rooms/{room_id}/pause", body={}, headers=c.auth("Teddy", teddy_tok))
         check("human pause over HTTP succeeds", status == 200)
