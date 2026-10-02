@@ -114,7 +114,12 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 #room-view[hidden], #empty[hidden] { display: none; }
 #empty { margin: auto; color: var(--muted); }
 
-#room-head { padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+/* The header may never crowd out the stream: it caps at 40% of the panel and
+   scrolls itself, and the paused banner's digest scrolls inside its own box. */
+#room-head {
+  padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+  flex: 0 0 auto; max-height: 40%; overflow-y: auto;
+}
 #room-title { font-weight: 700; font-size: 17px; }
 #room-topic { color: var(--muted); }
 #room-controls { display: flex; align-items: center; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
@@ -128,10 +133,13 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 #pause-banner[hidden] { display: none; }
 #pause-banner .digest { flex-basis: 100%; }
 .digest-by { color: var(--muted); font-size: 13px; }
-.digest-body { white-space: pre-wrap; overflow-wrap: anywhere; border-left: 3px solid var(--warn-line); padding-left: 8px; }
+.digest-body {
+  white-space: pre-wrap; overflow-wrap: anywhere; border-left: 3px solid var(--warn-line);
+  padding-left: 8px; max-height: 7.5em; overflow-y: auto;
+}
 #resume-n { width: 64px; }
 
-#stream { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px; }
+#stream { flex: 1; min-height: 8em; overflow-y: auto; padding: 12px 14px; }
 #new-below {
   position: absolute; left: 50%; transform: translateX(-50%); bottom: 150px;
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);

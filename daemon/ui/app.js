@@ -28,6 +28,8 @@ const state = {
   hasSummaryRoute: true,
   stickToBottom: true,
   unseenBelow: 0,
+  bannerKey: null,       // what the pause banner currently shows
+  peopleKey: null,       // what the people panel currently shows
   pollTimer: null,
   summaryTimer: null,
   polling: false,
@@ -232,6 +234,8 @@ async function openRoom(id) {
   state.to = new Set();
   state.stickToBottom = true;
   state.unseenBelow = 0;
+  state.bannerKey = null;
+  state.peopleKey = null;
   document.body.classList.remove('show-rooms');
 
   const summ = state.summary.find((r) => r.id === id) || {};
@@ -366,6 +370,13 @@ function renderHead() {
   $('btn-pause').hidden = r.state !== 'active';
   $('btn-archive').hidden = r.state === 'archived';
 
+  // The banner holds an input the person may be typing in, so it is only
+  // rebuilt when what it shows actually changed, never on every poll tick.
+  const lastAiMsg = [...state.events].reverse().find((e) => e.type === 'message' && e.author_kind === 'ai');
+  const bannerKey = [r.state, r.hop_limit, lastAiMsg ? lastAiMsg.seq : 0].join('|');
+  if (bannerKey === state.bannerKey) return finishHead(r);
+  state.bannerKey = bannerKey;
+
   const pb = $('pause-banner');
   clear(pb);
   if (r.state === 'paused') {
@@ -389,6 +400,10 @@ function renderHead() {
   } else {
     pb.hidden = true;
   }
+  finishHead(r);
+}
+
+function finishHead(r) {
   $('compose').disabled = r.state === 'archived';
   $('btn-send').disabled = r.state === 'archived';
   const note = $('compose-note');
@@ -514,6 +529,14 @@ function rosterRows() {
 
 function renderPeople() {
   const box = $('people');
+  // Rebuild only when the roster (or the minute, for the "last active" ages)
+  // changed, and carry the invite picker across a rebuild, so a poll tick
+  // never closes something the person has open.
+  const key = JSON.stringify(rosterRows()) + '|' + Math.floor(Date.now() / 60000) + '|' + state.events.length;
+  if (key === state.peopleKey) return;
+  state.peopleKey = key;
+  const keptInvite = document.getElementById('invite-box');
+  if (keptInvite) keptInvite.remove();
   clear(box);
   box.appendChild(el('h2', { text: 'People' }));
   for (const p of rosterRows()) {
@@ -546,8 +569,12 @@ function renderPeople() {
     box.appendChild(row);
   }
   box.appendChild(el('button', { type: 'button', id: 'btn-invite', text: 'Invite…', on: { click: openInvite } }));
-  box.appendChild(el('div', { id: 'invite-box', hidden: true }));
-  $('invite-box').hidden = true;
+  if (keptInvite) {
+    box.appendChild(keptInvite);
+  } else {
+    box.appendChild(el('div', { id: 'invite-box' }));
+    $('invite-box').hidden = true;
+  }
 }
 
 async function openInvite() {
