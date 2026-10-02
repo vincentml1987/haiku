@@ -4,6 +4,18 @@
 -- exists to make common queries cheap without rescanning the log.
 --
 -- See docs/haiku-room-spec.md for the model this implements.
+--
+-- MIGRATION GOTCHA (hit live 2026-10-02, adding 'archive' to events.type):
+-- every CREATE TABLE here is IF NOT EXISTS, so connect() only applies this
+-- file to a brand-new db. A CHECK constraint change (or any other
+-- ALTER-incompatible edit) does NOT retroactively touch an existing db
+-- file — the old constraint stays baked into that table until it's
+-- manually migrated (recreate the table, copy rows, rename; see git log
+-- for the one-off script used that time). The test suites can't catch
+-- this class of bug: they always start from a fresh db, so they only ever
+-- exercise the NEW schema, never a pre-existing one. Any time a CHECK
+-- constraint or column changes, check whether daemon/haiku.db (or any
+-- other live db) needs the same migration, don't just trust the tests.
 
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
