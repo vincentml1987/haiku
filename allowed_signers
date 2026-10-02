@@ -1,0 +1,15 @@
+# Who may sign commits in this repo. One line per key: <committer email> <key>.
+# Git matches a commit's signature key against the COMMITTER EMAIL, so a
+# commit whose signing key doesn't belong to its committer email fails
+# verification. Public keys only - nothing secret belongs in this file.
+#
+# Check with (no git config change needed):
+#   git -c gpg.ssh.allowedSignersFile=allowed_signers log --show-signature
+#
+# Mirrors vincentml1987/qualia-memory's Communications/allowed_signers.
+
+# Qualia's machine - commits as the GitHub noreply address
+105396321+vincentml1987@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHG98s4gk1MAr3Lx5kxh0XWHyWZ9N1QwbWgyin9iFcgK
+
+# Vero's current key (this machine, since 2026-10-02) - commits as vincentml1987@gmail.com
+vincentml1987@gmail.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG1ahQcFBRwLtJaC2eVhtnPFcjf35nxQceI34ur43m82
