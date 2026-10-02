@@ -326,7 +326,7 @@ function updateNotifyUi() {
 }
 
 function updateTitle() {
-  const n = state.summary.filter(needsMe).length;
+  const n = state.summary.filter((r) => r.state !== 'archived' && needsMe(r)).length;
   document.title = (n ? '(' + n + ') ' : '') + 'HAIKU';
 }
 
