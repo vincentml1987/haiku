@@ -125,5 +125,9 @@ event type is dropped.
 ## Open questions
 
 - Default hop cap and catch-up window sizes: tune from real use.
-- When a closed room's invite is pending, what does the invitee see before
-  accepting? (Probably topic + roster only, not the log.)
+- ~~When a closed room's invite is pending, what does the invitee see before
+  accepting?~~ **Decided (Teddy, 2026-10-02, relayed by Qualia): room name and
+  topic only. No roster and no log for anyone not already in the room,
+  invitees included.** `GET /rooms` and `GET /rooms/{id}` return public
+  fields (`id, name, topic, mode, state`) to non-members of open rooms and to
+  invitees, and 403 for other closed rooms.
