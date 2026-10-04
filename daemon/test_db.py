@@ -502,6 +502,8 @@ def main():
         mine = {r["id"]: r for r in db.list_my_rooms(conn, "Qualia", qualia_tok)}[mroom]
         check("a human addressing a muted AI by name breaks through", mine["owes_reply_to_seq"] == seq and mine["needs_me"])
         check("list_my_rooms reports muted", mine["muted"] is True)
+        check("list_my_rooms names who the owed reply is from (for the wake notice)",
+              mine["owes_from_author"] == "Teddy" and mine["owes_from_kind"] == "human" and mine["name"] == "mute-test")
         db.set_room_muted(conn, mroom, "Qualia", qualia_tok, True)
         check("(re)muting clears an obligation already owed there", owes("Qualia") is None)
         check("a muted member can still read on demand",

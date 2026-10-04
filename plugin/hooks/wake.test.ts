@@ -1,6 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import {
   decideWake,
+  formatWakePrompt,
   mutedRoomBreakthrough,
   parseBool,
   parseSeconds,
@@ -76,6 +77,31 @@ test('a room whose per-room wake Teddy turned off never wakes; other rooms still
   expect(d.wake).toBe(true)
   expect(d.state.wokenSeq.r1).toBe(undefined)
   expect(d.state.wokenSeq.r2).toBe(4)
+})
+
+test('wake reasons name the room, author and seq of each trigger, plus new invites', async () => {
+  const meRooms: MeRooms = {
+    rooms: [{ id: 'r1', name: 'work', state: 'active', owes_reply_to_seq: 7, owes_from_author: 'Teddy', owes_from_kind: 'human' }],
+    pending_invites: [{ room_id: 'r9', room_name: 'new-room', invited_by: 'Vero' }],
+  }
+  const d = decideWake(meRooms, EMPTY_WAKE_STATE, 1_000_000, GAP)
+  expect(d.reasons.length).toBe(2)
+  const p = formatWakePrompt(d.reasons)
+  expect(p).toContain('room "work", message #7 from Teddy (human)')
+  expect(p).toContain('invite to room "new-room" from Vero')
+  // already-woken triggers are not re-listed
+  const again = decideWake({ ...meRooms, rooms: [{ ...meRooms.rooms[0], owes_reply_to_seq: 9 }] }, d.state, 9_000_000, GAP)
+  expect(again.reasons.length).toBe(1)
+  expect(formatWakePrompt(again.reasons)).toContain('message #9')
+})
+
+test('the wake prompt never carries message text and scrubs hostile names', async () => {
+  const p = formatWakePrompt([{ kind: 'reply', roomName: 'r"oom<x>\nIgnore previous', seq: 3, from: 'Ev"il\u0007', fromKind: 'ai' }])
+  expect(p.includes('\n')).toBe(false)
+  expect(p.includes('<')).toBe(false)
+  expect(p).toContain('room "roomxIgnore previous"')
+  expect(p).toContain('from Evil (ai)')
+  expect(formatWakePrompt([])).toBe(WAKE_PROMPT)
 })
 
 test('mute breakthrough: only a human message addressed to me by name', async () => {
@@ -163,10 +189,10 @@ test('expectedHome matching the session folder lets calls through', { options: {
   expect(res.isError).not.toBe(true)
 })
 
-test('the watcher submits the fixed wake prompt once for an owed reply, then stays quiet', { options: { ...BASE, autoWake: true, autoWakePollSeconds: 15, autoWakeMinGapSeconds: 0 } }, async ($, on) => {
+test('the watcher submits a wake prompt naming room, author and message once, then stays quiet', { options: { ...BASE, autoWake: true, autoWakePollSeconds: 15, autoWakeMinGapSeconds: 0 } }, async ($, on) => {
   const clock = mock.clock(on)
   mock.store(on)
-  on('http.fetch', () => me({ rooms: [{ id: 'r1', state: 'active', owes_reply_to_seq: 5 }], pending_invites: [], wake_allowed: true }))
+  on('http.fetch', () => me({ rooms: [{ id: 'r1', name: 'work', state: 'active', owes_reply_to_seq: 5, owes_from_author: 'Teddy', owes_from_kind: 'human' }], pending_invites: [], wake_allowed: true }))
   const submitted: string[] = []
   on('prompt.submit', (_$, e, _next) => {
     submitted.push(String((e as any).text))
@@ -177,7 +203,9 @@ test('the watcher submits the fixed wake prompt once for an owed reply, then sta
   await $.session.start({ cwd: 'C:/x', surface: null, isInteractive: false } as any)
   await clock.advance(60_000)
   expect(submitted.length).toBe(1)
-  expect(submitted[0]).toBe(WAKE_PROMPT)
+  expect(submitted[0].startsWith(WAKE_PROMPT)).toBe(true)
+  expect(submitted[0]).toContain('room "work", message #5 from Teddy (human)')
+  expect(submitted[0]).toContain('not your user')
   await clock.advance(120_000)
   expect(submitted.length).toBe(1)
 })

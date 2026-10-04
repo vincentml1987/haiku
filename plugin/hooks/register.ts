@@ -40,7 +40,7 @@ import {
   type MeRooms,
   type WakeState,
   EMPTY_WAKE_STATE,
-  WAKE_PROMPT,
+  formatWakePrompt,
   MIN_POLL_SECONDS,
   DEFAULT_POLL_SECONDS,
   parseBool,
@@ -431,7 +431,7 @@ export const register: Register = (on, options) => {
             // never turn into a loop of billed re-wakes.
             await $.store.set(storeKey('wakeState', c.participantName), d.state)
           }
-          if (d.wake) await $.prompt.submit({ text: WAKE_PROMPT })
+          if (d.wake) await $.prompt.submit({ text: formatWakePrompt(d.reasons) })
         } catch {
           // daemon down, not configured, name mismatch: stay quiet, try next tick
         } finally {

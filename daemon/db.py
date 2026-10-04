@@ -847,11 +847,13 @@ def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
                   (SELECT COALESCE(MAX(seq), 0) FROM events WHERE room_id = rm.id) AS max_seq,
                   (SELECT MAX(ts) FROM events WHERE room_id = rm.id) AS last_event_ts,
                   COALESCE(rp.muted, 0) AS muted,
-                  COALESCE(rp.wake_allowed, 1) AS room_wake_allowed
+                  COALESCE(rp.wake_allowed, 1) AS room_wake_allowed,
+                  oe.author AS owes_from_author, oe.author_kind AS owes_from_kind
            FROM roster r
            JOIN rooms rm ON rm.id = r.room_id
            LEFT JOIN cursors c ON c.room_id = r.room_id AND c.participant = r.participant
            LEFT JOIN room_prefs rp ON rp.room_id = r.room_id AND rp.participant = r.participant
+           LEFT JOIN events oe ON oe.room_id = r.room_id AND oe.seq = r.owes_reply_to_seq
            WHERE r.participant = ? AND r.status != 'left'
            ORDER BY last_event_ts DESC""",
         (participant,),

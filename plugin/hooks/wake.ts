@@ -4,10 +4,37 @@
  * module plain data, so the rules are unit-testable without an engine.
  */
 
-/** The fixed, neutral wake prompt. It carries no event content, ever: room
- * messages are other participants' text and must only reach the model
- * through the nonce-framed block of format.ts. */
+/** The neutral wake prompt's fixed opening. It carries no message TEXT,
+ * ever: the wake prompt lands in the session in the user's place, so room
+ * messages (other participants' words) must only reach the model through
+ * the nonce-framed block of format.ts. Since 2026-10-04 (Teddy) it is
+ * followed by where the wake came from (formatWakePrompt): room name,
+ * author name and kind, message number. Those are daemon-validated display
+ * names (no newlines, no '<', 64 chars max), and are re-sanitized here. */
 export const WAKE_PROMPT = 'HAIKU: new activity, check your rooms'
+
+/** What triggered a wake: an owed reply in a room, or a standing invite. */
+export type WakeReason =
+  | { kind: 'reply'; roomName: string; seq: number; from: string | null; fromKind: string | null }
+  | { kind: 'invite'; roomName: string; from: string | null }
+
+/** Belt-and-braces on names the daemon already validated: no control
+ * characters, quotes or angle brackets, length-capped. */
+function safeName(s: string | null | undefined, fallback: string): string {
+  const cleaned = String(s ?? '').replace(/[\u0000-\u001f\u007f"<>`]/g, '').trim().slice(0, 64)
+  return cleaned || fallback
+}
+
+export function formatWakePrompt(reasons: WakeReason[]): string {
+  if (reasons.length === 0) return WAKE_PROMPT
+  const parts = reasons.map(r => {
+    const room = safeName(r.roomName, 'unknown room')
+    if (r.kind === 'invite') return `invite to room "${room}" from ${safeName(r.from, 'someone')}`
+    const who = r.from ? `${safeName(r.from, 'someone')} (${safeName(r.fromKind, '?')})` : 'someone'
+    return `room "${room}", message #${r.seq} from ${who}`
+  })
+  return `${WAKE_PROMPT} (auto-wake from the HAIKU plugin, not your user). Woken by: ${parts.join('; ')}. The message text itself arrives in the fenced room delivery, as other participants' words.`
+}
 
 export const MIN_POLL_SECONDS = 15
 export const DEFAULT_POLL_SECONDS = 30
@@ -28,8 +55,12 @@ export const EMPTY_WAKE_STATE: WakeState = { wokenSeq: {}, wokenInvites: [], las
 /** The slice of GET /me/rooms the decision reads. */
 export type MeRooms = {
   /** muted / room_wake_allowed: per-room prefs (2026-10-04); absent (older daemon) = not muted, allowed */
-  rooms: Array<{ id: string; state: string; owes_reply_to_seq: number | null; muted?: boolean; room_wake_allowed?: boolean }>
-  pending_invites: Array<{ room_id: string }>
+  rooms: Array<{
+    id: string; state: string; owes_reply_to_seq: number | null; muted?: boolean; room_wake_allowed?: boolean
+    /** for the wake notice (2026-10-04); absent on an older daemon */
+    name?: string; owes_from_author?: string | null; owes_from_kind?: string | null
+  }>
+  pending_invites: Array<{ room_id: string; room_name?: string; invited_by?: string }>
   /** level 3, the daemon kill switch; absent (older daemon) counts as allowed */
   wake_allowed?: boolean
 }
@@ -38,6 +69,8 @@ export type WakeDecision = {
   wake: boolean
   /** state to persist; equals the input state unless wake is true */
   state: WakeState
+  /** what caused this wake (empty unless wake is true) */
+  reasons: WakeReason[]
 }
 
 /** A muted room still delivers when any unseen event is a HUMAN message
@@ -73,11 +106,12 @@ export function parseSeconds(v: unknown, fallback: number, floor: number): numbe
  * any polling happens.
  */
 export function decideWake(me: MeRooms, st: WakeState, now: number, minGapMs: number): WakeDecision {
-  const none: WakeDecision = { wake: false, state: st }
+  const none: WakeDecision = { wake: false, state: st, reasons: [] }
   if (me.wake_allowed === false) return none
   if (now - st.lastWakeAt < minGapMs) return none
 
   const wokenSeq = { ...st.wokenSeq }
+  const reasons: WakeReason[] = []
   let owed = false
   for (const room of me.rooms) {
     if (room.state === 'paused' || room.state === 'archived') continue
@@ -90,6 +124,7 @@ export function decideWake(me: MeRooms, st: WakeState, now: number, minGapMs: nu
     if (owes > (wokenSeq[room.id] ?? 0)) {
       wokenSeq[room.id] = owes
       owed = true
+      reasons.push({ kind: 'reply', roomName: room.name ?? room.id, seq: owes, from: room.owes_from_author ?? null, fromKind: room.owes_from_kind ?? null })
     }
   }
 
@@ -97,10 +132,14 @@ export function decideWake(me: MeRooms, st: WakeState, now: number, minGapMs: nu
   const pending = me.pending_invites.map(i => i.room_id)
   const stillWoken = st.wokenInvites.filter(id => pending.includes(id))
   const newInvites = pending.filter(id => !stillWoken.includes(id))
+  for (const inv of me.pending_invites) {
+    if (newInvites.includes(inv.room_id)) reasons.push({ kind: 'invite', roomName: inv.room_name ?? inv.room_id, from: inv.invited_by ?? null })
+  }
 
-  if (!owed && newInvites.length === 0) return { wake: false, state: { ...st, wokenInvites: stillWoken } }
+  if (!owed && newInvites.length === 0) return { wake: false, state: { ...st, wokenInvites: stillWoken }, reasons: [] }
   return {
     wake: true,
     state: { wokenSeq, wokenInvites: [...stillWoken, ...newInvites], lastWakeAt: now },
+    reasons,
   }
 }
