@@ -467,6 +467,9 @@ function renderMarkdown(text) {
   return frag;
 }
 
+// NOTE: test_markdown.py slices this file between the "/* ---------- markdown"
+// and "/* ---------- API" headings. Keep both headings, and keep the
+// renderer between them.
 /* ---------- API ---------- */
 
 class ApiError extends Error {
@@ -1640,6 +1643,28 @@ function attachmentsNode(atts) {
       img.title = 'Click to enlarge or shrink';
       img.addEventListener('click', () => img.classList.toggle('big'));
       const status = el('span', { cls: 'meta', text: 'loading…' });
+      // A thumbnail the browser refuses (e.g. a page left open across a
+      // daemon restart still holds the old CSP) must not show a broken icon.
+      img.addEventListener('error', () => {
+        img.hidden = true;
+        status.textContent = 'could not display (try reloading the page)';
+        if (!status.isConnected) fig.querySelector('figcaption').appendChild(status);
+        const dl = el('button', {
+          type: 'button', cls: 'att-download', text: 'Download',
+          on: { click: async () => {
+            try {
+              const r = await fetchAttachment(roomId, a);
+              const link = document.createElement('a');
+              link.href = r.url;
+              link.download = safeFilename(a.filename);
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+            } catch (e) { setBanner('Download failed: ' + e.message); }
+          } },
+        });
+        fig.appendChild(dl);
+      }, { once: true });
       const load = () => {
         status.textContent = 'loading…';
         fetchAttachment(roomId, a).then((r) => {
