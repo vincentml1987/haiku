@@ -336,6 +336,12 @@ def main():
         check("CSP header present on an API response", csp_present)
         check("nosniff header present on an API response", nosniff)
 
+        # blob: is allowed for images only, never for scripts or by default.
+        directives = {d.strip().split(" ", 1)[0]: d.strip() for d in server.CSP.split(";") if d.strip()}
+        check("CSP img-src allows blob: (revocable attachment thumbnails)", "blob:" in directives["img-src"].split())
+        check("CSP never allows blob: or data: for scripts or by default",
+              not any(s in directives[k].split() for k in ("script-src", "default-src") for s in ("blob:", "data:")))
+
         # --- 404 ---
         status, resp = c.request("GET", "/nonsense")
         check("unknown route is 404", status == 404)

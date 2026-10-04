@@ -315,9 +315,12 @@ STATIC_FILES = {
 
 # ui-spec.md §1: no inline script/style, no external fetches, no CDN, no
 # web fonts, no framing. Sent on every UI (and, harmlessly, API) response.
+# blob: is allowed for IMAGES ONLY (2026-10-04, Tessera's UI review): the UI
+# shows fetched attachments as revocable same-origin blob: URLs instead of
+# base64 data: URLs. It must never appear in script-src or default-src.
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+    "connect-src 'self'; img-src 'self' data: blob:; base-uri 'none'; "
     "form-action 'none'; frame-ancestors 'none'"
 )
 
