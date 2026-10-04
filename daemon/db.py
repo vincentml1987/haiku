@@ -545,9 +545,9 @@ def _present_ai_participants(conn, room_id: str, exclude: str | None = None) -> 
     return [r["participant"] for r in rows]
 
 
-# Pending Teddy's call (2026-10-04, roles file): does a HUMAN message
-# addressed to a muted AI by name still reach it? Default yes, so a human
-# can always reach any of us; HAIKU exists for exactly that. Unaddressed,
+# Teddy's call (2026-10-04, haiku-update seq 8): a HUMAN message addressed
+# to a muted AI by name still reaches it, so a human can always reach any
+# of us; HAIKU exists for exactly that. Unaddressed,
 # ["all"], and AI-addressed traffic never break through a mute.
 MUTE_HUMAN_ADDRESSED_BREAKS_THROUGH = True
 
@@ -684,9 +684,9 @@ def pause_room(conn, room_id: str, paused_by: str, token: str, reason: str | Non
         _insert_event(conn, room_id, paused_by, "human", "pause", body=reason)
 
 
-# Pending Teddy's call (2026-10-04): the archive stamp's clock. UTC matches
-# every event `ts` in the log; False would use the daemon machine's local time.
-ARCHIVE_STAMP_UTC = True
+# Teddy's call (2026-10-04, haiku-update seq 8): the archive stamp is in
+# LOCAL time (the daemon machine's clock), unlike event `ts`, which stays UTC.
+ARCHIVE_STAMP_UTC = False
 NAME_MAX_LEN = 64
 
 
