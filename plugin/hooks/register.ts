@@ -32,8 +32,10 @@ import {
   listRooms,
   readEvents,
   ackEvents,
+  setRoomMuted,
 } from './client'
 import { formatRoomDelivery, makeNonce, type HaikuEvent } from './format'
+import { homeMismatch } from './identity'
 import {
   type MeRooms,
   type WakeState,
@@ -129,6 +131,23 @@ function creds(options: Record<string, unknown>): HaikuCreds {
   return { daemonUrl, participantName, participantToken }
 }
 
+/**
+ * creds() plus the home-folder guard (2026-10-04, see identity.ts): with
+ * expectedHome set, the session's own working folder must match it or
+ * every HAIKU call fails before anything reaches the daemon. Checked on
+ * every call rather than once at session.start, so a hot reload (which
+ * drops module state) can never leave the guard silently off.
+ */
+async function guardedCreds($: Engine, options: Record<string, unknown>): Promise<HaikuCreds> {
+  const c = creds(options)
+  const expectedHome = String(options.expectedHome ?? '')
+  if (expectedHome) {
+    const err = homeMismatch(expectedHome, await $.session.cwd(), c.participantName)
+    if (err) throw new Error(err)
+  }
+  return c
+}
+
 async function getJoinedRooms($: Engine, participantName: string): Promise<JoinedRoom[]> {
   const v = await $.store.get(storeKey('joinedRooms', participantName))
   return Array.isArray(v) ? (v as JoinedRoom[]) : []
@@ -171,7 +190,20 @@ function errorResult(e: unknown) {
 async function catchUp($: Engine, c: HaikuCreds) {
   const fetch = makeFetch($, c)
   const rooms = await getJoinedRooms($, c.participantName)
+  if (rooms.length === 0) return
+  // Muted rooms (2026-10-04) are skipped unless a human got through by
+  // addressing this AI by name (then owes_reply_to_seq is set). Skipping
+  // does NOT ack: the cursor stays put, so haiku_read with no since= still
+  // shows everything unseen whenever the AI chooses to look.
+  let muted = new Map<string, boolean>()
+  try {
+    const me = (await fetch('GET', '/me/rooms')) as MeRooms
+    muted = new Map(me.rooms.map(r => [r.id, !!r.muted && r.owes_reply_to_seq == null]))
+  } catch {
+    // older daemon or a hiccup: deliver as before rather than go silent
+  }
   for (const room of rooms) {
+    if (muted.get(room.id)) continue
     // One room's failure (daemon hiccup, room archived mid-session, a bad
     // append) must not abort every later room's catch-up.
     try {
@@ -241,7 +273,7 @@ async function sessionWakeFlag($: Engine, name: string): Promise<boolean> {
 
 /** `/haiku-wake` and haiku_autowake share this: "on" is refused above the ceiling. */
 async function applyWakeMode($: Engine, options: Record<string, unknown>, mode: string): Promise<string> {
-  const c = creds(options)
+  const c = await guardedCreds($, options)
   const ceiling = wakeCeiling(options)
   if (mode === 'on') {
     if (!ceiling) {
@@ -338,6 +370,15 @@ export const register: Register = (on, options) => {
       inputSchema: { type: 'object', properties: { room_id: { type: 'string' }, granted_hops: { type: 'number' } }, required: ['room_id'] },
     })
     await $.tool.register({
+      name: 'haiku_mute',
+      description: 'Mute or unmute a HAIKU room for yourself only. Muted: no automatic delivery, no wake, and no reply owed for unaddressed traffic; you stay a member and can haiku_read it whenever you choose. A human addressing you by name still gets through.',
+      inputSchema: {
+        type: 'object',
+        properties: { room_id: { type: 'string' }, muted: { type: 'boolean' } },
+        required: ['room_id', 'muted'],
+      },
+    })
+    await $.tool.register({
       name: 'haiku_rooms',
       description: 'List HAIKU rooms this session has joined, and all rooms known to the daemon.',
       inputSchema: { type: 'object', properties: {} },
@@ -345,7 +386,7 @@ export const register: Register = (on, options) => {
 
     // --- identity visibility + auto-wake (spec 3a) ---
     try {
-      const c0 = creds(options)
+      const c0 = await guardedCreds($, options)
       const eff = wakeCeiling(options) && (await sessionWakeFlag($, c0.participantName))
       const line = `HAIKU as ${c0.participantName}, autoWake: ${eff ? 'on' : 'off'}`
       $.ui.status(line)
@@ -375,7 +416,7 @@ export const register: Register = (on, options) => {
         if (waking) return
         waking = true
         try {
-          const c = creds(options)
+          const c = await guardedCreds($, options)
           if (!(await sessionWakeFlag($, c.participantName))) return
           const fetch = makeFetch($, c)
           const me = (await fetch('GET', '/me/rooms')) as MeRooms
@@ -405,7 +446,7 @@ export const register: Register = (on, options) => {
     }
 
     try {
-      await catchUp($, creds(options))
+      await catchUp($, await guardedCreds($, options))
     } catch {
       // not configured yet, or daemon unreachable — tools still register; a
       // send/read call will surface the real error to the model directly.
@@ -416,7 +457,7 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     try {
-      await catchUp($, creds(options))
+      await catchUp($, await guardedCreds($, options))
     } catch {
       // see session.start — silent here too, never block a user prompt over it
     }
@@ -441,7 +482,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_send' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await sendMessage(fetch, e.room_id as string, e.body as string, e.addressed_to as string[] | undefined)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
@@ -451,7 +492,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_read' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await readEvents(fetch, e.room_id as string, { since: e.since as number | undefined, limit: e.limit as number | undefined })
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
@@ -461,7 +502,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_pass' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await sendPass(fetch, e.room_id as string)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
@@ -471,7 +512,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_join' }, async ($, e) => {
     try {
-      const c = creds(options)
+      const c = await guardedCreds($, options)
       const fetch = makeFetch($, c)
       const result = await joinRoom(fetch, e.room_id as string, e.catch_up as number | undefined)
       const info = await getRoom(fetch, e.room_id as string)
@@ -484,7 +525,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_leave' }, async ($, e) => {
     try {
-      const c = creds(options)
+      const c = await guardedCreds($, options)
       const fetch = makeFetch($, c)
       const result = await leaveRoom(fetch, e.room_id as string)
       await removeJoinedRoom($, c.participantName, e.room_id as string)
@@ -496,7 +537,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_create_room' }, async ($, e) => {
     try {
-      const c = creds(options)
+      const c = await guardedCreds($, options)
       const fetch = makeFetch($, c)
       const result = await createRoom(fetch, e.name as string, {
         topic: e.topic as string | undefined,
@@ -512,7 +553,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_invite' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await inviteToRoom(fetch, e.room_id as string, e.invitee as string)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
@@ -522,7 +563,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_topic' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await setTopic(fetch, e.room_id as string, e.topic as string)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
@@ -532,8 +573,18 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_resume' }, async ($, e) => {
     try {
-      const fetch = makeFetch($, creds(options))
+      const fetch = makeFetch($, await guardedCreds($, options))
       const result = await resumeRoom(fetch, e.room_id as string, e.granted_hops as number | undefined)
+      return { result: JSON.stringify(result, null, 2) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_mute' }, async ($, e) => {
+    try {
+      const fetch = makeFetch($, await guardedCreds($, options))
+      const result = await setRoomMuted(fetch, e.room_id as string, e.muted === true)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)
@@ -542,7 +593,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__haiku__haiku_rooms' }, async $ => {
     try {
-      const c = creds(options)
+      const c = await guardedCreds($, options)
       const fetch = makeFetch($, c)
       const joined = await getJoinedRooms($, c.participantName)
       const all = await listRooms(fetch)

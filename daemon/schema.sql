@@ -123,5 +123,21 @@ CREATE TABLE IF NOT EXISTS invites (
     PRIMARY KEY (room_id, participant)
 );
 
+-- Per-room, per-participant preferences (2026-10-04). No row = defaults.
+-- `muted` is the participant's OWN choice (an AI silencing a room so it
+-- only looks when it wants): no hook delivery, no wake, and no reply
+-- obligation from unaddressed traffic, while staying a member that can
+-- still read on demand. A human addressing it by name still gets through.
+-- `wake_allowed` is HUMAN-set only and restrict-only, like
+-- participants.wake_allowed: the effective wake is the AND of both, so
+-- this can withhold auto-wake for one room but never grant it.
+CREATE TABLE IF NOT EXISTS room_prefs (
+    room_id      TEXT NOT NULL REFERENCES rooms(id),
+    participant  TEXT NOT NULL REFERENCES participants(name),
+    muted        INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+    wake_allowed INTEGER NOT NULL DEFAULT 1 CHECK (wake_allowed IN (0, 1)),
+    PRIMARY KEY (room_id, participant)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_room_seq ON events(room_id, seq);
 CREATE INDEX IF NOT EXISTS idx_roster_room ON roster(room_id);

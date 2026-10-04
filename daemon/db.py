@@ -40,7 +40,7 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # with no user_version set (every db from before this system existed)
 # is treated as v1. A db whose user_version is HIGHER than this code
 # knows is refused outright rather than run against blindly.
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def _migrate_v1_to_v2(conn):
@@ -80,7 +80,22 @@ def _migrate_v2_to_v3(conn):
         conn.commit()
 
 
-MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3}
+def _migrate_v3_to_v4(conn):
+    """Adds room_prefs (per-room mute + per-room wake_allowed). schema.sql
+    already creates it IF NOT EXISTS on every connect, so this only has to
+    exist to keep the version number honest; it is idempotent either way."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_prefs (
+            room_id      TEXT NOT NULL REFERENCES rooms(id),
+            participant  TEXT NOT NULL REFERENCES participants(name),
+            muted        INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+            wake_allowed INTEGER NOT NULL DEFAULT 1 CHECK (wake_allowed IN (0, 1)),
+            PRIMARY KEY (room_id, participant)
+        )
+    """)
+
+
+MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4}
 
 
 def _migrate(conn, db_path, existed_before: bool):
@@ -260,7 +275,7 @@ def _name_taken(conn, name: str) -> bool:
     ).fetchone() is not None
 
 
-def _validate_display_name(name: str, max_len: int = 64):
+def _validate_display_name(name: str, max_len: int = 64):  # keep equal to NAME_MAX_LEN
     """A name (participant or room) is rendered unfenced in the hook's
     delivery block (spec §4 / hook-format.md) — author names, room names,
     and addressed_to entries all sit outside the "| " body fence. The
@@ -462,9 +477,13 @@ def join_room(conn, room_id: str, participant: str, token: str,
     (latest_seq - catch_up) instead of 0, so the first read only surfaces
     the last N events. A rejoin ignores catch_up and keeps the cursor it
     already has ("everything since it last left")."""
-    authenticate(conn, participant, token)
+    kind = authenticate(conn, participant, token)
     room = _get_room(conn, room_id)
-    if room["mode"] == "closed" and participant != room["created_by"]:
+    # A human is HAIKU's admin (Teddy, 2026-10-04): may join any room,
+    # closed or not, uninvited. Checked against the AUTHENTICATED kind,
+    # never anything the caller asserts. It is an ordinary join, so it
+    # lands as a visible join event like any other: no silent lurking.
+    if room["mode"] == "closed" and participant != room["created_by"] and kind != "human":
         if not (_was_ever_member(conn, room_id, participant) or _has_invite(conn, room_id, participant)):
             raise HaikuError("room is closed; ask a human member to invite you")
     with _transaction(conn):
@@ -526,6 +545,21 @@ def _present_ai_participants(conn, room_id: str, exclude: str | None = None) -> 
     return [r["participant"] for r in rows]
 
 
+# Pending Teddy's call (2026-10-04, roles file): does a HUMAN message
+# addressed to a muted AI by name still reach it? Default yes, so a human
+# can always reach any of us; HAIKU exists for exactly that. Unaddressed,
+# ["all"], and AI-addressed traffic never break through a mute.
+MUTE_HUMAN_ADDRESSED_BREAKS_THROUGH = True
+
+
+def _is_muted(conn, room_id: str, participant: str) -> bool:
+    row = conn.execute(
+        "SELECT muted FROM room_prefs WHERE room_id = ? AND participant = ?",
+        (room_id, participant),
+    ).fetchone()
+    return bool(row and row["muted"])
+
+
 def _validate_addressees(conn, room_id: str, names: list[str]):
     if names == ["all"]:
         return
@@ -573,16 +607,18 @@ def send_message(conn, room_id: str, author: str, token: str, body: str,
                 _set_obligation(conn, room_id, name, None)
             if addressed_to and addressed_to != ["all"]:
                 for name in addressed_to:
-                    _set_obligation(conn, room_id, name, seq)
+                    if MUTE_HUMAN_ADDRESSED_BREAKS_THROUGH or not _is_muted(conn, room_id, name):
+                        _set_obligation(conn, room_id, name, seq)
             else:
                 for name in _present_ai_participants(conn, room_id, exclude=author):
-                    _set_obligation(conn, room_id, name, seq)
+                    if not _is_muted(conn, room_id, name):
+                        _set_obligation(conn, room_id, name, seq)
             new_state = room["state"]
         else:
             _set_obligation(conn, room_id, author, None)  # own message discharges own obligation
             if addressed_to and addressed_to != ["all"]:
                 for name in addressed_to:
-                    if name != author:
+                    if name != author and not _is_muted(conn, room_id, name):
                         _set_obligation(conn, room_id, name, seq)
             new_hop_count = room["hop_count"] + 1
             new_state = room["state"]
@@ -648,9 +684,32 @@ def pause_room(conn, room_id: str, paused_by: str, token: str, reason: str | Non
         _insert_event(conn, room_id, paused_by, "human", "pause", body=reason)
 
 
-def archive_room(conn, room_id: str, archived_by: str, token: str) -> None:
+# Pending Teddy's call (2026-10-04): the archive stamp's clock. UTC matches
+# every event `ts` in the log; False would use the daemon machine's local time.
+ARCHIVE_STAMP_UTC = True
+NAME_MAX_LEN = 64
+
+
+def _archived_name(conn, name: str, when: datetime) -> str:
+    """Teddy, 2026-10-04: archiving appends -AYYYYMMDDHHMMSS so the list
+    shows when. The room id never changes (cursors, events, invites all key
+    on it), only the display name. rooms.name is UNIQUE and capped at
+    NAME_MAX_LEN, so the base is trimmed to fit, and a collision (two
+    same-named rooms archived in the same second) gets -2, -3, ..."""
+    stamp = "-A" + when.strftime("%Y%m%d%H%M%S")
+    candidate = name[: NAME_MAX_LEN - len(stamp)] + stamp
+    n = 2
+    while conn.execute("SELECT 1 FROM rooms WHERE name = ?", (candidate,)).fetchone():
+        suffix = f"{stamp}-{n}"
+        candidate = name[: NAME_MAX_LEN - len(suffix)] + suffix
+        n += 1
+    return candidate
+
+
+def archive_room(conn, room_id: str, archived_by: str, token: str) -> str:
     """ui-spec.md §5/§7.3: ends a room; stays readable, no further sends.
-    Human-only."""
+    Human-only. Renames the room (see _archived_name) and records the old
+    name in the archive event's body. Returns the new name."""
     kind = authenticate(conn, archived_by, token)
     if kind != "human":
         raise HaikuError("only a human can archive a room")
@@ -659,9 +718,13 @@ def archive_room(conn, room_id: str, archived_by: str, token: str) -> None:
         raise HaikuError("the lobby cannot be archived")
     if room["state"] == "archived":
         raise HaikuError("room is already archived")
+    when = datetime.now(timezone.utc) if ARCHIVE_STAMP_UTC else datetime.now()
     with _transaction(conn):
-        conn.execute("UPDATE rooms SET state = 'archived' WHERE id = ?", (room_id,))
-        _insert_event(conn, room_id, archived_by, kind, "archive")
+        new_name = _archived_name(conn, room["name"], when)
+        conn.execute("UPDATE rooms SET state = 'archived', name = ? WHERE id = ?", (new_name, room_id))
+        _insert_event(conn, room_id, archived_by, kind, "archive",
+                      body=f"archived; renamed from {room['name']!r} to {new_name!r}")
+    return new_name
 
 
 def read_events(conn, room_id: str, participant: str, token: str,
@@ -782,10 +845,13 @@ def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
                   r.owes_reply_to_seq,
                   COALESCE(c.last_delivered_seq, 0) AS cursor_seq,
                   (SELECT COALESCE(MAX(seq), 0) FROM events WHERE room_id = rm.id) AS max_seq,
-                  (SELECT MAX(ts) FROM events WHERE room_id = rm.id) AS last_event_ts
+                  (SELECT MAX(ts) FROM events WHERE room_id = rm.id) AS last_event_ts,
+                  COALESCE(rp.muted, 0) AS muted,
+                  COALESCE(rp.wake_allowed, 1) AS room_wake_allowed
            FROM roster r
            JOIN rooms rm ON rm.id = r.room_id
            LEFT JOIN cursors c ON c.room_id = r.room_id AND c.participant = r.participant
+           LEFT JOIN room_prefs rp ON rp.room_id = r.room_id AND rp.participant = r.participant
            WHERE r.participant = ? AND r.status != 'left'
            ORDER BY last_event_ts DESC""",
         (participant,),
@@ -798,7 +864,11 @@ def list_my_rooms(conn, participant: str, token: str) -> list[dict]:
         # than rename and risk the other callers/tests of max_seq/cursor_seq.
         d["last_seq"] = d["max_seq"]
         d["my_cursor"] = d["cursor_seq"]
-        d["needs_me"] = d["state"] == "paused" or d["owes_reply_to_seq"] is not None
+        d["muted"] = bool(d["muted"])
+        d["room_wake_allowed"] = bool(d["room_wake_allowed"])
+        # A muted room only "needs me" when someone actually got through
+        # (a human addressed me by name); a pause alone doesn't count there.
+        d["needs_me"] = d["owes_reply_to_seq"] is not None or (d["state"] == "paused" and not d["muted"])
         result.append(d)
     return result
 
@@ -815,6 +885,42 @@ def set_wake_allowed(conn, caller: str, token: str, target: str, allowed: bool) 
     if cur.rowcount == 0:
         raise HaikuError(f"no such participant: {target}")
     conn.commit()
+
+
+def set_room_muted(conn, room_id: str, participant: str, token: str, muted: bool) -> None:
+    """An AI (or anyone) mutes a room for ITSELF only: no hook delivery, no
+    wake, no obligations from unaddressed traffic. Must be a current
+    member; still able to read on demand. Muting also clears any obligation
+    it currently owes there, since it has chosen not to be on the hook."""
+    authenticate(conn, participant, token)
+    _get_room(conn, room_id)
+    _require_member(conn, room_id, participant)
+    with _transaction(conn):
+        conn.execute(
+            """INSERT INTO room_prefs (room_id, participant, muted) VALUES (?, ?, ?)
+               ON CONFLICT(room_id, participant) DO UPDATE SET muted = excluded.muted""",
+            (room_id, participant, 1 if muted else 0),
+        )
+        if muted:
+            _set_obligation(conn, room_id, participant, None)
+
+
+def set_room_wake_allowed(conn, caller: str, token: str, room_id: str, target: str, allowed: bool) -> None:
+    """Teddy, 2026-10-04: per-room, per-AI auto-wake switch. Human callers
+    only, restrict-only (ANDed with participants.wake_allowed and the
+    plugin's own levels; it can withhold a wake, never cause one)."""
+    if authenticate(conn, caller, token) != "human":
+        raise Forbidden("only a human may change a room's wake_allowed")
+    _get_room(conn, room_id)
+    row = conn.execute("SELECT name FROM participants WHERE name = ? COLLATE NOCASE", (target,)).fetchone()
+    if row is None:
+        raise HaikuError(f"no such participant: {target}")
+    with _transaction(conn):
+        conn.execute(
+            """INSERT INTO room_prefs (room_id, participant, wake_allowed) VALUES (?, ?, ?)
+               ON CONFLICT(room_id, participant) DO UPDATE SET wake_allowed = excluded.wake_allowed""",
+            (room_id, row["name"], 1 if allowed else 0),
+        )
 
 
 def get_wake_allowed(conn, participant: str) -> bool:
@@ -897,17 +1003,22 @@ def room_roster(conn, room_id: str) -> list[dict]:
         """SELECT r.participant, p.kind, r.status, r.owes_reply_to_seq,
                   (SELECT MAX(ts) FROM events WHERE room_id = r.room_id AND author = r.participant) AS last_authored_ts,
                   c.updated_at AS cursor_ts,
-                  oe.author AS owes_from_author, oe.ts AS owes_from_ts
+                  oe.author AS owes_from_author, oe.ts AS owes_from_ts,
+                  COALESCE(rp.muted, 0) AS muted,
+                  COALESCE(rp.wake_allowed, 1) AS room_wake_allowed
            FROM roster r
            JOIN participants p ON p.name = r.participant
            LEFT JOIN cursors c ON c.room_id = r.room_id AND c.participant = r.participant
            LEFT JOIN events oe ON oe.room_id = r.room_id AND oe.seq = r.owes_reply_to_seq
+           LEFT JOIN room_prefs rp ON rp.room_id = r.room_id AND rp.participant = r.participant
            WHERE r.room_id = ? ORDER BY r.participant""",
         (room_id,),
     ).fetchall()
     result = []
     for row in rows:
         d = dict(row)
+        d["muted"] = bool(d["muted"])
+        d["room_wake_allowed"] = bool(d["room_wake_allowed"])
         last_authored = d.pop("last_authored_ts")
         cursor_ts = d.pop("cursor_ts")
         d["last_active_ts"] = max(filter(None, [last_authored, cursor_ts]), default=None)

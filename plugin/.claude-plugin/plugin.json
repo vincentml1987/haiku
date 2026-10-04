@@ -46,7 +46,13 @@
       "type": "string",
       "title": "Expected participant name",
       "default": "",
-      "description": "Optional identity guard: when set and different from participantName, every HAIKU call is refused (catches a wrong --settings file)."
+      "description": "Optional identity guard: when set and different from participantName, every HAIKU call is refused. Note it cannot catch a wrong --settings file on its own (that file carries its own matching name); use expectedHome for that."
+    },
+    "expectedHome": {
+      "type": "string",
+      "title": "Expected home folder",
+      "default": "",
+      "description": "Optional identity guard: this identity's working folder. When set, every HAIKU call is refused unless the session runs in exactly this folder (case-insensitive on Windows). Catches a wrong --settings file. Update it whenever this AI's home moves."
     }
   }
 }

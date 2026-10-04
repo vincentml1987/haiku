@@ -67,6 +67,16 @@ test('the daemon kill switch (wake_allowed false) withholds every wake and chang
   expect(d.state).toBe(EMPTY_WAKE_STATE)
 })
 
+test('a room whose per-room wake Teddy turned off never wakes; other rooms still do', async () => {
+  const off: MeRooms = { rooms: [{ ...room('r1', 3), room_wake_allowed: false }], pending_invites: [] }
+  expect(decideWake(off, EMPTY_WAKE_STATE, 1_000_000, GAP).wake).toBe(false)
+  const mixed: MeRooms = { rooms: [{ ...room('r1', 3), room_wake_allowed: false }, room('r2', 4)], pending_invites: [] }
+  const d = decideWake(mixed, EMPTY_WAKE_STATE, 1_000_000, GAP)
+  expect(d.wake).toBe(true)
+  expect(d.state.wokenSeq.r1).toBe(undefined)
+  expect(d.state.wokenSeq.r2).toBe(4)
+})
+
 test('option parsing: autoWake defaults OFF, poll has a floor', async () => {
   expect(parseBool(undefined)).toBe(false)
   expect(parseBool('')).toBe(false)
@@ -117,6 +127,28 @@ test('expectedName mismatch refuses HAIKU calls loudly', { options: { ...BASE, e
   const res: any = await $.tool.call({ tool: 'mcp__haiku__haiku_send', room_id: 'r1', body: 'hi' } as any)
   expect(res.isError).toBe(true)
   expect(String(res.result).includes('identity mismatch')).toBe(true)
+})
+
+test('expectedHome mismatch (wrong --settings file) refuses HAIKU calls', { options: { ...BASE, expectedHome: 'C:\\AIs\\TestAI' } }, async ($, on) => {
+  mock.store(on)
+  on('session.cwd', () => ({ value: 'C:\\AIs\\SomeoneElse' }))
+  let sent = 0
+  on('http.fetch', () => {
+    sent++
+    return me({ seq: 1 })
+  })
+  const res: any = await $.tool.call({ tool: 'mcp__haiku__haiku_send', room_id: 'r1', body: 'hi' } as any)
+  expect(res.isError).toBe(true)
+  expect(String(res.result).includes('identity guard')).toBe(true)
+  expect(sent).toBe(0)
+})
+
+test('expectedHome matching the session folder lets calls through', { options: { ...BASE, expectedHome: 'C:\\AIs\\TestAI' } }, async ($, on) => {
+  mock.store(on)
+  on('session.cwd', () => ({ value: 'c:/ais/testai/' }))
+  on('http.fetch', () => me({ seq: 1, room_state: 'active' }))
+  const res: any = await $.tool.call({ tool: 'mcp__haiku__haiku_send', room_id: 'r1', body: 'hi' } as any)
+  expect(res.isError).not.toBe(true)
 })
 
 test('the watcher submits the fixed wake prompt once for an owed reply, then stays quiet', { options: { ...BASE, autoWake: true, autoWakePollSeconds: 15, autoWakeMinGapSeconds: 0 } }, async ($, on) => {

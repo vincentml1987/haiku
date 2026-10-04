@@ -257,8 +257,27 @@ def h_pause(conn, params, body, headers, room_id):
 @route("POST", f"/rooms/{ROOM_ID}/archive")
 def h_archive(conn, params, body, headers, room_id):
     archiver, token = _auth_headers(headers)
-    db.archive_room(conn, room_id, archiver, token)
-    return {"ok": True}
+    new_name = db.archive_room(conn, room_id, archiver, token)
+    return {"ok": True, "name": new_name}
+
+
+@route("PUT", f"/rooms/{ROOM_ID}/mute")
+def h_mute(conn, params, body, headers, room_id):
+    """The caller mutes/unmutes a room for itself only."""
+    participant, token = _auth_headers(headers)
+    if not isinstance(body.get("muted"), bool):
+        raise ClientError(400, "muted must be true or false")
+    db.set_room_muted(conn, room_id, participant, token, body["muted"])
+    return {"ok": True, "muted": body["muted"]}
+
+
+@route("PUT", f"/rooms/{ROOM_ID}/wake_allowed/(?P<name>[^/]+)")
+def h_set_room_wake_allowed(conn, params, body, headers, room_id, name):
+    caller, token = _auth_headers(headers)
+    if not isinstance(body.get("allowed"), bool):
+        raise ClientError(400, "allowed must be true or false")
+    db.set_room_wake_allowed(conn, caller, token, room_id, unquote(name), body["allowed"])
+    return {"ok": True, "name": unquote(name), "room_wake_allowed": body["allowed"]}
 
 
 def _host_ok(host_header: str, port: int) -> bool:

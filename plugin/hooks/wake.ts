@@ -27,7 +27,8 @@ export const EMPTY_WAKE_STATE: WakeState = { wokenSeq: {}, wokenInvites: [], las
 
 /** The slice of GET /me/rooms the decision reads. */
 export type MeRooms = {
-  rooms: Array<{ id: string; state: string; owes_reply_to_seq: number | null }>
+  /** muted / room_wake_allowed: per-room prefs (2026-10-04); absent (older daemon) = not muted, allowed */
+  rooms: Array<{ id: string; state: string; owes_reply_to_seq: number | null; muted?: boolean; room_wake_allowed?: boolean }>
   pending_invites: Array<{ room_id: string }>
   /** level 3, the daemon kill switch; absent (older daemon) counts as allowed */
   wake_allowed?: boolean
@@ -70,6 +71,10 @@ export function decideWake(me: MeRooms, st: WakeState, now: number, minGapMs: nu
   let owed = false
   for (const room of me.rooms) {
     if (room.state === 'paused' || room.state === 'archived') continue
+    // Teddy's per-room switch is restrict-only: off here withholds the wake.
+    // (A muted room needs no check: the daemon sets no obligation there
+    // unless a human addressed this AI by name, which is meant to wake it.)
+    if (room.room_wake_allowed === false) continue
     const owes = room.owes_reply_to_seq
     if (owes == null) continue
     if (owes > (wokenSeq[room.id] ?? 0)) {

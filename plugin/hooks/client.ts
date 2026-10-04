@@ -78,6 +78,11 @@ export function readEvents(
   return fetch('GET', `/rooms/${roomId}/events`, undefined, query)
 }
 
+/** Mutes/unmutes a room for this participant only (2026-10-04). */
+export function setRoomMuted(fetch: HaikuFetch, roomId: string, muted: boolean) {
+  return fetch('PUT', `/rooms/${roomId}/mute`, { muted })
+}
+
 export function ackEvents(fetch: HaikuFetch, roomId: string, throughSeq: number) {
   return fetch('POST', `/rooms/${roomId}/ack`, { through_seq: throughSeq })
 }

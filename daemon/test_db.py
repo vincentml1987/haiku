@@ -449,6 +449,94 @@ def main():
         db.join_room(conn, inv_room, "Isolated", iso_tok)
         check("joining consumes the pending invite", db.list_pending_invites(conn, "Isolated") == [])
 
+        # --- 2026-10-04: human admin may join any closed room, visibly ---
+        ai_closed = db.create_room(conn, "qualia-private", "Qualia", qualia_tok)  # closed by default
+        try:
+            db.join_room(conn, ai_closed, "Vero", vero_tok)
+            check("an uninvited AI still cannot join a closed room", False)
+        except db.HaikuError:
+            check("an uninvited AI still cannot join a closed room", True)
+        db.join_room(conn, ai_closed, "Teddy", teddy_tok)
+        roster = {x["participant"]: x["status"] for x in db.room_roster(conn, ai_closed)}
+        check("a human joins a closed room uninvited", roster.get("Teddy") == "present")
+        evs = db.read_events(conn, ai_closed, "Teddy", teddy_tok, since=0)["events"]
+        check("the admin join is a visible join event", any(e["type"] == "join" and e["author"] == "Teddy" for e in evs))
+
+        # --- 2026-10-04: archive renames with -AYYYYMMDDHHMMSS, id unchanged ---
+        arch = db.create_room(conn, "to-archive", "Teddy", teddy_tok)
+        new_name = db.archive_room(conn, arch, "Teddy", teddy_tok)
+        import re as _re
+        check("archived name is base + -A + 14 digits", _re.fullmatch(r"to-archive-A\d{14}", new_name) is not None)
+        check("the room keeps its id and gets the new name", db._get_room(conn, arch)["name"] == new_name)
+        last = db.read_events(conn, arch, "Teddy", teddy_tok, since=0)["events"][-1]
+        check("archive event records the old and new name",
+              last["type"] == "archive" and "to-archive" in last["body"] and new_name in last["body"])
+        long_room = db.create_room(conn, "L" * 64, "Teddy", teddy_tok)
+        long_new = db.archive_room(conn, long_room, "Teddy", teddy_tok)
+        check("a 64-char name is trimmed to fit the cap after renaming", len(long_new) <= 64 and long_new.startswith("L"))
+        # Collision: two rooms whose stamped names would be identical.
+        from datetime import datetime as _dt
+        fixed = _dt(2026, 10, 4, 12, 0, 0)
+        first = db._archived_name(conn, "dupe", fixed)
+        conn.execute("UPDATE rooms SET name = ? WHERE id = ?", (first, db.create_room(conn, "dupe-src", "Teddy", teddy_tok)))
+        second = db._archived_name(conn, "dupe", fixed)
+        check("a colliding stamped name gets a -2 suffix instead of an IntegrityError", second == first + "-2")
+
+        # --- 2026-10-04: per-room mute ---
+        mroom = db.create_room(conn, "mute-test", "Teddy", teddy_tok, mode="open")
+        db.join_room(conn, mroom, "Qualia", qualia_tok)
+        db.join_room(conn, mroom, "Vero", vero_tok)
+
+        def owes(name):
+            return {x["participant"]: x["owes_reply_to_seq"] for x in db.room_roster(conn, mroom)}[name]
+
+        db.set_room_muted(conn, mroom, "Qualia", qualia_tok, True)
+        db.send_message(conn, mroom, "Teddy", teddy_tok, "unaddressed hello")
+        check("unaddressed human message: a muted AI owes nothing", owes("Qualia") is None)
+        check("unaddressed human message: an unmuted AI still owes", owes("Vero") is not None)
+        db.send_message(conn, mroom, "Teddy", teddy_tok, "to everyone", addressed_to=["all"])
+        check("['all'] does not break through a mute", owes("Qualia") is None)
+        db.send_message(conn, mroom, "Vero", vero_tok, "hey Qualia", addressed_to=["Qualia"])
+        check("an AI addressing a muted AI by name does not break through", owes("Qualia") is None)
+        seq = db.send_message(conn, mroom, "Teddy", teddy_tok, "Qualia, you there?", addressed_to=["Qualia"])["seq"]
+        mine = {r["id"]: r for r in db.list_my_rooms(conn, "Qualia", qualia_tok)}[mroom]
+        check("a human addressing a muted AI by name breaks through", mine["owes_reply_to_seq"] == seq and mine["needs_me"])
+        check("list_my_rooms reports muted", mine["muted"] is True)
+        db.set_room_muted(conn, mroom, "Qualia", qualia_tok, True)
+        check("(re)muting clears an obligation already owed there", owes("Qualia") is None)
+        check("a muted member can still read on demand",
+              len(db.read_events(conn, mroom, "Qualia", qualia_tok, since=0)["events"]) > 0)
+        try:
+            db.set_room_muted(conn, mroom, "Out", outsider_tok, True)
+            check("a non-member cannot mute a room", False)
+        except db.HaikuError:
+            check("a non-member cannot mute a room", True)
+        db.set_room_muted(conn, mroom, "Qualia", qualia_tok, False)
+        db.send_message(conn, mroom, "Teddy", teddy_tok, "unaddressed again")
+        check("after unmuting, unaddressed traffic creates obligations again", owes("Qualia") is not None)
+
+        # --- 2026-10-04: per-room, per-AI wake_allowed (human-only, restrict-only) ---
+        def room_wake(name, tok):
+            return {r["id"]: r for r in db.list_my_rooms(conn, name, tok)}[mroom]["room_wake_allowed"]
+
+        check("per-room wake defaults to allowed", room_wake("Vero", vero_tok) is True)
+        try:
+            db.set_room_wake_allowed(conn, "Qualia", qualia_tok, mroom, "Vero", False)
+            check("an AI cannot change a room's wake_allowed", False)
+        except db.Forbidden:
+            check("an AI cannot change a room's wake_allowed", True)
+        db.set_room_wake_allowed(conn, "Teddy", teddy_tok, mroom, "vero", False)  # case-insensitive target
+        check("a human can turn one AI's wake off for one room", room_wake("Vero", vero_tok) is False)
+        check("it does not touch another AI in the same room", room_wake("Qualia", qualia_tok) is True)
+        check("it does not touch the global switch", db.get_wake_allowed(conn, "Vero") is True)
+        vrow = {x["participant"]: x for x in db.room_roster(conn, mroom)}["Vero"]
+        check("the roster carries room_wake_allowed for the UI grid", vrow["room_wake_allowed"] is False)
+        try:
+            db.set_room_wake_allowed(conn, "Teddy", teddy_tok, mroom, "Nobody", False)
+            check("unknown target rejected", False)
+        except db.HaikuError:
+            check("unknown target rejected", True)
+
         print("\nALL CHECKS PASSED")
     finally:
         cleanup(conn)
