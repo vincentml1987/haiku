@@ -324,9 +324,11 @@ def main():
         conn2.request("GET", "/nonexistent-route-for-csp-check", headers={"Host": f"127.0.0.1:{PORT}"})
         raw_resp = conn2.getresponse()
         csp_present = raw_resp.getheader("Content-Security-Policy") is not None
+        nosniff = raw_resp.getheader("X-Content-Type-Options") == "nosniff"
         raw_resp.read()
         conn2.close()
         check("CSP header present on an API response", csp_present)
+        check("nosniff header present on an API response", nosniff)
 
         # --- 404 ---
         status, resp = c.request("GET", "/nonsense")
