@@ -4,12 +4,17 @@
  * Trust rule: every string that came from a participant (body, name, room
  * name, topic, reason) is untrusted. It is only ever put into the page with
  * textContent / createTextNode, never innerHTML, and never used to build a
- * URL, selector, id or handler. The only DOM-building helper is el().
+ * URL, selector, id or handler. The only DOM-building helpers are el() and
+ * the markdown renderer below, which builds elements one by one with
+ * createElement/textContent and never parses HTML. Its one exception to
+ * "never build a URL" is a link's href, which is only set after new URL()
+ * accepts it with an http:, https: or mailto: scheme (safeUrl()).
  */
 'use strict';
 
 const LS_KEY = 'haiku.creds';
 const LS_NOTIFY = 'haiku.notify';
+const LS_VIEW = 'haiku.view';
 const POLL_ACTIVE_MS = 2000;
 const POLL_BG_MS = 15000;
 const SUMMARY_MS = 5000;
@@ -37,6 +42,9 @@ const state = {
   pollTimer: null,
   summaryTimer: null,
   polling: false,
+  isHuman: null,         // null = not checked yet; humans get the admin room list
+  allRooms: [],          // GET /rooms (humans see every room)
+  view: { markdown: true, showArchived: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -96,6 +104,300 @@ function asList(v) {
     return v ? [v] : [];
   }
   return [];
+}
+
+/* ---------- markdown (Teddy, 2026-10-04) ----------
+ *
+ * A small CommonMark-ish subset, rendered straight to DOM nodes. There is no
+ * HTML parsing step at all: raw HTML in a message shows as literal text,
+ * because every piece of text goes in through createTextNode/textContent.
+ * Supported: headings, paragraphs (single newlines kept as line breaks),
+ * fenced code, block quotes, bulleted and numbered lists, horizontal rules,
+ * `code`, **bold**, *italic*, ~~strike~~, [links](url), <autolinks> and bare
+ * http(s) URLs. Images are shown as links, never loaded (the CSP blocks
+ * remote images anyway, and a fetched image would leak that Teddy read it).
+ * Nesting depth is capped so a hostile message can't blow the stack.
+ */
+
+const MD_MAX_DEPTH = 8;
+
+function safeUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  let u;
+  try { u = new URL(s); } catch (e) { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'mailto:') return null;
+  return u.href;
+}
+
+function linkNode(href, children, isImage) {
+  const a = document.createElement('a');
+  a.href = href;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer nofollow';
+  a.title = href;
+  a.className = isImage ? 'md-imglink' : '';
+  if (isImage) a.appendChild(document.createTextNode('[image] '));
+  for (const c of children) a.appendChild(c);
+  if (!a.childNodes.length) a.textContent = href;
+  return a;
+}
+
+const RE_AUTOLINK = /<((?:https?:\/\/|mailto:)[^\s<>]+)>/y;
+const RE_BAREURL = /https?:\/\/[^\s<>()\[\]]*[^\s<>()\[\].,;:!?'"*_~]/y;
+const RE_ESCAPABLE = /[\\`*_{}\[\]()#+\-.!~>|<]/;
+
+function isWordChar(ch) { return !!ch && /[\p{L}\p{N}]/u.test(ch); }
+
+// Finds "[text](url)" starting at s[i] === '['. Returns {text, url, end} or null.
+function matchLink(s, i) {
+  let depth = 0;
+  let j = i;
+  for (; j < s.length; j++) {
+    const ch = s[j];
+    if (ch === '\\') { j++; continue; }
+    if (ch === '[') depth++;
+    else if (ch === ']') { depth--; if (depth === 0) break; }
+    else if (ch === '\n' && s[j + 1] === '\n') return null;
+  }
+  if (j >= s.length || s[j + 1] !== '(') return null;
+  const close = s.indexOf(')', j + 2);
+  if (close < 0) return null;
+  let inner = s.slice(j + 2, close).trim();
+  const titled = /^(\S+)\s+(?:"[^"]*"|'[^']*')$/.exec(inner);
+  if (titled) inner = titled[1];
+  if (inner.startsWith('<') && inner.endsWith('>')) inner = inner.slice(1, -1);
+  return { text: s.slice(i + 1, j), url: inner, end: close + 1 };
+}
+
+function mdInline(s, depth) {
+  const out = [];
+  let buf = '';
+  const flush = () => { if (buf) { out.push(document.createTextNode(buf)); buf = ''; } };
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+
+    if (c === '\\' && i + 1 < s.length && RE_ESCAPABLE.test(s[i + 1])) {
+      buf += s[i + 1]; i += 2; continue;
+    }
+
+    if (c === '`') {
+      let n = 0;
+      while (s[i + n] === '`') n++;
+      const fence = '`'.repeat(n);
+      let end = s.indexOf(fence, i + n);
+      while (end >= 0 && s[end + n] === '`') end = s.indexOf(fence, end + n + 1);
+      if (end >= 0) {
+        flush();
+        let code = s.slice(i + n, end).replace(/\n/g, ' ');
+        if (code.length > 2 && code[0] === ' ' && code[code.length - 1] === ' ') code = code.slice(1, -1);
+        out.push(el('code', { text: code }));
+        i = end + n;
+        continue;
+      }
+      buf += fence; i += n; continue;
+    }
+
+    if ((c === '[' || (c === '!' && s[i + 1] === '[')) && depth < MD_MAX_DEPTH) {
+      const isImage = c === '!';
+      const m = matchLink(s, isImage ? i + 1 : i);
+      if (m) {
+        const href = safeUrl(m.url);
+        flush();
+        if (href) {
+          out.push(linkNode(href, mdInline(m.text, depth + 1), isImage));
+        } else {
+          // Unsafe or unparseable target: keep the text, drop the link.
+          for (const n of mdInline(m.text, depth + 1)) out.push(n);
+          out.push(document.createTextNode(' (' + m.url + ')'));
+        }
+        i = m.end;
+        continue;
+      }
+    }
+
+    if (c === '<') {
+      RE_AUTOLINK.lastIndex = i;
+      const m = RE_AUTOLINK.exec(s);
+      const href = m && safeUrl(m[1]);
+      if (href) { flush(); out.push(linkNode(href, [document.createTextNode(m[1])], false)); i = RE_AUTOLINK.lastIndex; continue; }
+    }
+
+    if (c === 'h' && !isWordChar(s[i - 1])) {
+      RE_BAREURL.lastIndex = i;
+      const m = RE_BAREURL.exec(s);
+      const href = m && safeUrl(m[0]);
+      if (href) { flush(); out.push(linkNode(href, [document.createTextNode(m[0])], false)); i = RE_BAREURL.lastIndex; continue; }
+    }
+
+    if ((c === '*' || c === '_' || c === '~') && depth < MD_MAX_DEPTH) {
+      let run = 0;
+      while (s[i + run] === c) run++;
+      let len;
+      let tag;
+      if (c === '~') { len = 2; tag = 'del'; if (run !== 2) { buf += c.repeat(run); i += run; continue; } }
+      else if (run >= 2) { len = 2; tag = 'strong'; }
+      else { len = 1; tag = 'em'; }
+      const after = s[i + len];
+      const leftOk = after && !/\s/.test(after) && !(c === '_' && isWordChar(s[i - 1]));
+      if (leftOk) {
+        const marker = c.repeat(len);
+        let j = s.indexOf(marker, i + len);
+        while (j >= 0) {
+          while (s[j + len] === c) j++;          // close at the END of a run: ***x*** = strong(em(x))
+          const before = s[j - 1];
+          const okClose = j > i + len && before && !/\s/.test(before) && !(c === '_' && isWordChar(s[j + len]));
+          if (okClose) break;
+          j = s.indexOf(marker, j + len);
+        }
+        if (j >= 0) {
+          flush();
+          const node = document.createElement(tag);
+          for (const n of mdInline(s.slice(i + len, j), depth + 1)) node.appendChild(n);
+          out.push(node);
+          i = j + len;
+          continue;
+        }
+      }
+      buf += c.repeat(run); i += run; continue;
+    }
+
+    buf += c;
+    i++;
+  }
+  flush();
+  return out;
+}
+
+const RE_FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/;
+const RE_HEADING = /^ {0,3}(#{1,6})(?:\s+(.*?))?\s*#*\s*$/;
+const RE_HR = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const RE_QUOTE = /^ {0,3}> ?(.*)$/;
+const RE_LIST = /^( {0,3})([-*+]|\d{1,9}[.)])\s+(.*)$/;
+
+function startsBlock(line) {
+  return RE_FENCE.test(line) || RE_HEADING.test(line) || RE_HR.test(line) || RE_QUOTE.test(line) || RE_LIST.test(line);
+}
+
+function mdBlocks(lines, depth, into) {
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (!line.trim()) { i++; continue; }
+
+    let m = RE_FENCE.exec(line);
+    if (m) {
+      const fence = m[1];
+      const body = [];
+      i++;
+      const isClose = (l) => {
+        const t = l.trim();
+        return t.length >= fence.length && t.split('').every((ch) => ch === fence[0]);
+      };
+      while (i < lines.length && !isClose(lines[i])) {
+        body.push(lines[i]);
+        i++;
+      }
+      i++; // closing fence (or end of input)
+      const code = el('code', { text: body.join('\n') });
+      if (m[2]) code.dataset.lang = m[2].slice(0, 20);
+      into.appendChild(el('pre', null, [code]));
+      continue;
+    }
+
+    m = RE_HEADING.exec(line);
+    if (m) {
+      const h = document.createElement('h' + m[1].length);
+      for (const n of mdInline(m[2] || '', depth)) h.appendChild(n);
+      into.appendChild(h);
+      i++;
+      continue;
+    }
+
+    if (RE_HR.test(line)) { into.appendChild(document.createElement('hr')); i++; continue; }
+
+    if (RE_QUOTE.test(line)) {
+      const inner = [];
+      while (i < lines.length && lines[i].trim()) {
+        const q = RE_QUOTE.exec(lines[i]);
+        inner.push(q ? q[1] : lines[i]);
+        i++;
+      }
+      const bq = document.createElement('blockquote');
+      if (depth < MD_MAX_DEPTH) mdBlocks(inner, depth + 1, bq);
+      else bq.textContent = inner.join('\n');
+      into.appendChild(bq);
+      continue;
+    }
+
+    m = RE_LIST.exec(line);
+    if (m) {
+      const ordered = /\d/.test(m[2]);
+      const list = document.createElement(ordered ? 'ol' : 'ul');
+      if (ordered) {
+        const start = parseInt(m[2], 10);
+        if (start !== 1 && start < 1e9) list.start = start;
+      }
+      const items = [];
+      while (i < lines.length) {
+        const cur = lines[i];
+        const lm = RE_LIST.exec(cur);
+        if (lm && /\d/.test(lm[2]) === ordered && !RE_HR.test(cur)) {
+          items.push([lm[3]]);
+          i++;
+          continue;
+        }
+        if (!cur.trim()) {
+          const next = lines[i + 1];
+          if (next !== undefined && (/^\s{2,}\S/.test(next) || (RE_LIST.test(next) && /\d/.test(RE_LIST.exec(next)[2]) === ordered))) {
+            items[items.length - 1].push('');
+            i++;
+            continue;
+          }
+          break;
+        }
+        if (/^\s{2,}\S/.test(cur)) {
+          items[items.length - 1].push(cur.replace(/^ {2,4}|^\t/, ''));
+          i++;
+          continue;
+        }
+        const last = items[items.length - 1];
+        if (last[last.length - 1].trim() && !startsBlock(cur)) { last.push(cur); i++; continue; }
+        break;
+      }
+      for (const it of items) {
+        const li = document.createElement('li');
+        if (depth < MD_MAX_DEPTH) mdBlocks(it, depth + 1, li);
+        else li.textContent = it.join('\n');
+        list.appendChild(li);
+      }
+      into.appendChild(list);
+      continue;
+    }
+
+    // Paragraph: runs until a blank line or the start of another block.
+    const para = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !startsBlock(lines[i])) {
+      para.push(lines[i]);
+      i++;
+    }
+    const p = document.createElement('p');
+    para.forEach((pl, k) => {
+      if (k) p.appendChild(document.createElement('br'));
+      for (const n of mdInline(pl.replace(/^\s+/, ''), depth)) p.appendChild(n);
+    });
+    into.appendChild(p);
+  }
+  return into;
+}
+
+function renderMarkdown(text) {
+  const frag = document.createDocumentFragment();
+  mdBlocks(String(text == null ? '' : text).replace(/\r\n?/g, '\n').split('\n'), 0, frag);
+  return frag;
 }
 
 /* ---------- API ---------- */
@@ -193,6 +495,19 @@ async function refreshSummary() {
   }
   state.summary = rooms || [];
   state.invites = invites;
+  // A human is HAIKU's admin (Teddy, 2026-10-04) and may see and join every
+  // room. The daemon decides that from the authenticated kind; this only
+  // decides whether to show the extra list. /participants returns the
+  // wake_allowed field to human callers only.
+  if (state.isHuman === null) {
+    await loadWake();
+    state.isHuman = state.wake !== null;
+  }
+  if (state.isHuman) {
+    try { state.allRooms = (await api('GET', '/rooms')).rooms || []; } catch (e) {
+      if (e instanceof ApiError && e.status === 401) throw e;
+    }
+  }
   checkNotifications();
   renderRoomList();
   updateTitle();
@@ -354,28 +669,138 @@ function renderRoomList() {
   const groups = [
     ['Needs you', (r) => r.state !== 'archived' && needsMe(r)],
     ['Active', (r) => r.state !== 'archived' && !needsMe(r)],
-    ['Archived', (r) => r.state === 'archived'],
   ];
   for (const [label, pred] of groups) {
     const rows = state.summary.filter(pred);
     if (!rows.length) continue;
     nav.appendChild(el('h2', { text: label + ' (' + rows.length + ')' }));
-    for (const r of rows) {
-      const kids = [el('span', { cls: 'room-name', text: r.name })];
-      if (r.unread > 0) kids.push(el('span', { cls: 'badge', text: r.unread, title: r.unread + ' unread' }));
-      if (r.state === 'paused') kids.push(el('span', { cls: 'chip paused', text: 'paused' }));
-      if (r.state === 'archived') kids.push(el('span', { cls: 'chip', text: 'archived' }));
-      const btn = el('button', {
-        type: 'button',
-        cls: 'room-row' + (r.id === state.roomId ? ' current' : ''),
-        data: { room: r.id },
-        aria: { current: r.id === state.roomId ? 'true' : 'false' },
-        on: { click: () => openRoom(r.id) },
-      }, kids);
-      nav.appendChild(btn);
-    }
+    for (const r of rows) nav.appendChild(memberRow(r));
   }
-  if (!state.summary.length && !invites.length) nav.appendChild(el('p', { cls: 'muted', text: 'No rooms yet.' }));
+
+  // Rooms the human isn't in (admin view). Joining is an ordinary, visible
+  // join event, so the button says so.
+  const mine = new Set(state.summary.map((r) => r.id));
+  const invited = new Set(invites.map((i) => i.room_id));
+  const others = state.allRooms.filter((r) => !mine.has(r.id) && !invited.has(r.id));
+  const otherActive = others.filter((r) => r.state !== 'archived');
+  if (otherActive.length) {
+    nav.appendChild(el('h2', { text: 'Other rooms (' + otherActive.length + ')' }));
+    for (const r of otherActive) nav.appendChild(otherRow(r));
+  }
+
+  const archivedMine = state.summary.filter((r) => r.state === 'archived');
+  const archivedOther = others.filter((r) => r.state === 'archived');
+  const nArchived = archivedMine.length + archivedOther.length;
+  const ab = $('btn-archived');
+  ab.hidden = nArchived === 0;
+  ab.textContent = state.view.showArchived ? 'Hide archived' : 'Show archived (' + nArchived + ')';
+  ab.setAttribute('aria-pressed', state.view.showArchived ? 'true' : 'false');
+  if (state.view.showArchived && nArchived) {
+    nav.appendChild(el('h2', { text: 'Archived (' + nArchived + ')' }));
+    for (const r of archivedMine) nav.appendChild(memberRow(r));
+    for (const r of archivedOther) nav.appendChild(otherRow(r));
+  }
+
+  if (!state.summary.length && !invites.length && !others.length) nav.appendChild(el('p', { cls: 'muted', text: 'No rooms yet.' }));
+}
+
+function memberRow(r) {
+  const kids = [el('span', { cls: 'room-name', text: r.name, title: r.name })];
+  if (r.unread > 0) kids.push(el('span', { cls: 'badge', text: r.unread, title: r.unread + ' unread' }));
+  if (r.state === 'paused') kids.push(el('span', { cls: 'chip paused', text: 'paused' }));
+  if (r.state === 'archived') kids.push(el('span', { cls: 'chip', text: 'archived' }));
+  return el('button', {
+    type: 'button',
+    cls: 'room-row' + (r.id === state.roomId ? ' current' : ''),
+    data: { room: r.id },
+    aria: { current: r.id === state.roomId ? 'true' : 'false' },
+    on: { click: () => openRoom(r.id) },
+  }, kids);
+}
+
+function otherRow(r) {
+  const info = [el('span', { cls: 'room-name', text: r.name, title: r.topic ? r.name + ' (' + r.topic + ')' : r.name })];
+  info.push(el('span', { cls: 'chip', text: r.mode === 'open' ? 'open' : 'closed' }));
+  return el('div', { cls: 'other-row' }, [
+    el('div', { cls: 'other-info' }, info),
+    el('button', {
+      type: 'button',
+      cls: 'invite-accept',
+      text: 'Join',
+      title: 'Join to read and post. Your join shows in the room like anyone else\'s.',
+      on: { click: (ev) => acceptInvite(r.id, ev.currentTarget) },
+    }),
+  ]);
+}
+
+function toggleArchived() {
+  state.view.showArchived = !state.view.showArchived;
+  saveView();
+  renderRoomList();
+}
+
+/* ---------- creating a room ---------- */
+
+function showNewRoom(open) {
+  const f = $('new-room');
+  f.hidden = !open;
+  $('nr-note').textContent = '';
+  if (open) $('nr-name').focus();
+}
+
+async function createRoom() {
+  const name = $('nr-name').value.trim();
+  const topic = $('nr-topic').value.trim();
+  const hops = parseInt($('nr-hops').value, 10);
+  if (!name) { $('nr-note').textContent = 'A room needs a name.'; return; }
+  const body = { name, mode: $('nr-mode').value === 'open' ? 'open' : 'closed' };
+  if (topic) body.topic = topic;
+  if (Number.isInteger(hops) && hops >= 1 && hops <= 100) body.hop_limit = hops;
+  $('nr-create').disabled = true;
+  try {
+    const res = await api('POST', '/rooms', body);
+    $('new-room').reset();
+    showNewRoom(false);
+    await refreshSummary();
+    await openRoom(res.room_id);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401)) $('nr-note').textContent = 'Could not create: ' + e.message;
+  } finally {
+    $('nr-create').disabled = false;
+  }
+}
+
+/* ---------- view preferences (this browser only) ---------- */
+
+function loadView() {
+  try {
+    const p = JSON.parse(localStorage.getItem(LS_VIEW) || '{}');
+    if (typeof p.markdown === 'boolean') state.view.markdown = p.markdown;
+    if (typeof p.showArchived === 'boolean') state.view.showArchived = p.showArchived;
+  } catch (e) { /* defaults */ }
+}
+
+function saveView() {
+  try { localStorage.setItem(LS_VIEW, JSON.stringify(state.view)); } catch (e) { /* ignore */ }
+}
+
+function updateMdButton() {
+  const b = $('btn-md');
+  b.textContent = state.view.markdown ? 'Markdown: on' : 'Markdown: off';
+  b.setAttribute('aria-pressed', state.view.markdown ? 'true' : 'false');
+}
+
+function toggleMarkdownView() {
+  state.view.markdown = !state.view.markdown;
+  saveView();
+  updateMdButton();
+  if (state.roomId && state.room) {
+    const s = $('stream');
+    const top = s.scrollTop;
+    const atBottom = isNearBottom();
+    renderStream();
+    s.scrollTop = atBottom ? s.scrollHeight : top;
+  }
 }
 
 async function acceptInvite(roomId, btn) {
@@ -583,6 +1008,7 @@ function renderHead() {
 function finishHead(r) {
   $('compose').disabled = r.state === 'archived';
   $('btn-send').disabled = r.state === 'archived';
+  $('btn-editor').disabled = r.state === 'archived';
   const note = $('compose-note');
   note.textContent = r.state === 'paused' ? 'Room is paused. Your message will be posted but will not resume it.' : '';
 }
@@ -597,6 +1023,7 @@ function systemLine(ev) {
     case 'topic_change': text = who + ' changed the topic' + (ev.body ? ': ' + ev.body : ''); break;
     case 'pause': text = 'Room paused' + (ev.body ? ': ' + ev.body : ''); break;
     case 'resume': text = 'Room resumed' + (ev.body ? ': ' + ev.body : ''); break;
+    case 'archive': text = who + ' archived the room' + (ev.body ? ' (' + ev.body + ')' : ''); break;
     default: text = who + ' ' + ev.type;
   }
   return el('div', { cls: 'sys', id: 'seq-' + ev.seq, title: 'seq ' + ev.seq + ' ' + ev.ts, text });
@@ -615,21 +1042,25 @@ function messageNode(ev) {
   ]);
   const bodyText = ev.body == null ? '' : String(ev.body);
   const lines = bodyText.split('\n');
-  const body = el('div', { cls: 'msg-body' });
-  const full = bodyText;
+  const md = state.view.markdown;
+  const body = el('div', { cls: md ? 'msg-body md' : 'msg-body' });
+  const fill = (text) => {
+    clear(body);
+    if (md) body.appendChild(renderMarkdown(text));
+    else body.textContent = text;
+  };
+  let content = body;
   if (lines.length > FOLD_LINES) {
-    body.textContent = lines.slice(0, FOLD_LINES).join('\n');
+    fill(lines.slice(0, FOLD_LINES).join('\n'));
     const more = el('button', {
       type: 'button', cls: 'linklike', text: 'show all ' + lines.length + ' lines',
-      on: { click: () => { body.textContent = full; more.remove(); } },
+      on: { click: () => { fill(bodyText); more.remove(); } },
     });
-    const wrap = el('div', null, [body, more]);
-    const art = el('article', { cls: 'msg ' + (isHuman ? 'by-human' : 'by-ai'), id: 'seq-' + ev.seq }, [head, wrap]);
-    art.style.setProperty('--hue', String(hueOf(ev.author)));
-    return art;
+    content = el('div', null, [body, more]);
+  } else {
+    fill(bodyText);
   }
-  body.textContent = full;
-  const art = el('article', { cls: 'msg ' + (isHuman ? 'by-human' : 'by-ai'), id: 'seq-' + ev.seq }, [head, body]);
+  const art = el('article', { cls: 'msg ' + (isHuman ? 'by-human' : 'by-ai'), id: 'seq-' + ev.seq }, [head, content]);
   art.style.setProperty('--hue', String(hueOf(ev.author)));
   return art;
 }
@@ -745,17 +1176,37 @@ function renderPeople() {
     }
     // Wake kill switch (spec 3a, level 3): humans only, AI rows only. The
     // daemon only sends the flag to human callers, so no flag means no control.
+    if (kind === 'ai' && p.muted) {
+      row.appendChild(el('div', {
+        cls: 'person-status muted-note', text: 'muted this room',
+        title: 'This AI chose not to be delivered this room. Messages you address to it by name still reach it.',
+      }));
+    }
     if (kind === 'ai' && state.wake && typeof state.wake[p.participant] === 'boolean') {
       const allowed = state.wake[p.participant];
       row.appendChild(el('button', {
         type: 'button', cls: 'linklike wake-toggle' + (allowed ? '' : ' wake-off'),
-        text: allowed ? 'Wake: allowed' : 'Wake: blocked',
+        text: allowed ? 'Wake, all rooms: allowed' : 'Wake, all rooms: blocked',
         title: allowed
-          ? 'This AI may be woken for replies if its own settings allow it. Click to block.'
-          : 'This AI will not be woken, whatever its own settings say. Click to allow again.',
+          ? 'This AI may be woken for replies if its own settings allow it. Click to block it in every room.'
+          : 'This AI will not be woken in any room, whatever its own settings say. Click to allow again.',
         aria: { pressed: !allowed },
         on: { click: () => setWake(p.participant, !allowed) },
       }));
+      // Per-room switch (Teddy, 2026-10-04). Restrict-only: ANDed with the
+      // all-rooms switch above and the AI's own settings.
+      if (typeof p.room_wake_allowed === 'boolean') {
+        const here = p.room_wake_allowed;
+        row.appendChild(el('button', {
+          type: 'button', cls: 'linklike wake-toggle' + (here ? '' : ' wake-off'),
+          text: here ? 'Wake, this room: allowed' : 'Wake, this room: blocked',
+          title: here
+            ? 'Click to stop this AI being woken by this room only.'
+            : 'This AI will not be woken by this room. Click to allow again (other switches still apply).',
+          aria: { pressed: !here },
+          on: { click: () => setRoomWake(p.participant, !here) },
+        }));
+      }
     }
     box.appendChild(row);
   }
@@ -792,6 +1243,20 @@ async function setWake(name, allowed) {
     setBanner((allowed ? 'Allowed waking for ' : 'Blocked waking for ') + name + '.');
   } catch (e) {
     setBanner('Could not change wake setting: ' + e.message);
+  }
+}
+
+async function setRoomWake(name, allowed) {
+  const roomId = state.roomId;
+  try {
+    await api('PUT', '/rooms/' + encodeURIComponent(roomId) + '/wake_allowed/' + encodeURIComponent(name), { allowed });
+    if (state.roomId === roomId) {
+      state.room = await api('GET', '/rooms/' + encodeURIComponent(roomId));
+      renderPeople();
+    }
+    setBanner((allowed ? 'Allowed waking for ' : 'Blocked waking for ') + name + ' in this room.');
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401)) setBanner('Could not change wake setting: ' + e.message);
   }
 }
 
@@ -873,27 +1338,189 @@ function renderComposerEffect() {
   }
 }
 
-async function sendCurrent() {
-  const ta = $('compose');
-  const body = ta.value.trim();
-  if (!body || !state.roomId) return;
+// Posts `text` to the open room with the current To: selection. Returns
+// true on success; on failure writes the reason into `noteEl`.
+async function sendBody(text, noteEl) {
+  const body = text.trim();
+  if (!body || !state.roomId) return false;
   const payload = { body };
   if (state.to.size) payload.addressed_to = [...state.to];
-  $('btn-send').disabled = true;
   try {
     const res = await api('POST', '/rooms/' + encodeURIComponent(state.roomId) + '/send', payload);
-    ta.value = '';
     setBanner('');
     $('compose-note').textContent = 'Sent as #' + res.seq + '.';
     state.stickToBottom = true;
     await pollOnce();
     const s = $('stream');
     s.scrollTop = s.scrollHeight;
+    return true;
   } catch (e) {
-    if (!(e instanceof ApiError && e.status === 401)) $('compose-note').textContent = 'Send failed: ' + e.message;
+    if (!(e instanceof ApiError && e.status === 401)) noteEl.textContent = 'Send failed: ' + e.message;
+    return false;
+  }
+}
+
+async function sendCurrent() {
+  const ta = $('compose');
+  $('btn-send').disabled = true;
+  try {
+    if (await sendBody(ta.value, $('compose-note'))) ta.value = '';
   } finally {
     $('btn-send').disabled = !!(state.room && state.room.state === 'archived');
   }
+}
+
+/* ---------- markdown editor dialog (Teddy, 2026-10-04) ----------
+ *
+ * A pop-out editor with formatting buttons and a source/preview switch. It
+ * shares the quick box's To: selection. Closing it any way other than Send
+ * or Discard puts the text back in the quick box, so nothing is lost.
+ */
+
+const editor = { outcome: null, preview: false };
+
+function openEditor() {
+  if (!state.roomId || (state.room && state.room.state === 'archived')) return;
+  const d = $('md-dialog');
+  const t = $('md-text');
+  t.value = $('compose').value;
+  editor.outcome = null;
+  setEditorPreview(false);
+  $('md-to').textContent = $('to-effect').textContent;
+  $('md-note').textContent = 'Ctrl+Enter sends. Ctrl+P switches to the preview.';
+  d.showModal();
+  t.focus();
+  t.setSelectionRange(t.value.length, t.value.length);
+}
+
+function closeEditor(outcome) {
+  editor.outcome = outcome;
+  $('md-dialog').close();
+}
+
+function onEditorClosed() {
+  // Escape, or the Back button: keep the text in the quick box.
+  if (editor.outcome !== 'sent' && editor.outcome !== 'discard') $('compose').value = $('md-text').value;
+  if (editor.outcome === 'sent') $('compose').value = '';
+  editor.outcome = null;
+  $('compose').focus();
+}
+
+function setEditorPreview(on) {
+  editor.preview = on;
+  const t = $('md-text');
+  const p = $('md-preview');
+  const b = $('md-view');
+  if (on) {
+    clear(p);
+    p.appendChild(renderMarkdown(t.value));
+    if (!t.value.trim()) p.appendChild(el('p', { cls: 'muted', text: 'Nothing to preview yet.' }));
+    p.style.setProperty('min-height', t.offsetHeight + 'px');
+  }
+  t.hidden = on;
+  p.hidden = !on;
+  b.textContent = on ? 'Edit' : 'Preview';
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  for (const btn of document.querySelectorAll('#md-toolbar [data-md]')) btn.disabled = on;
+  if (!on) t.focus();
+}
+
+// Replace the textarea's selection, keeping the browser's undo history
+// where execCommand still works, falling back to setRangeText.
+function replaceSelection(t, text, selStart, selEnd) {
+  t.focus();
+  const start = t.selectionStart;
+  let ok = false;
+  try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
+  if (!ok) t.setRangeText(text, t.selectionStart, t.selectionEnd, 'end');
+  if (selStart != null) t.setSelectionRange(start + selStart, start + selEnd);
+}
+
+function wrapSelection(t, before, after, placeholder) {
+  const sel = t.value.slice(t.selectionStart, t.selectionEnd);
+  const inner = sel || placeholder;
+  replaceSelection(t, before + inner + after, before.length, before.length + inner.length);
+}
+
+// Prefix every line the selection touches (headings, quotes, lists).
+function prefixLines(t, makePrefix) {
+  const v = t.value;
+  const ls = t.selectionStart === 0 ? 0 : v.lastIndexOf('\n', t.selectionStart - 1) + 1;
+  let end = t.selectionEnd;
+  if (end > t.selectionStart && v[end - 1] === '\n') end--; // selection ending at a line break
+  let le = v.indexOf('\n', end);
+  if (le < 0) le = v.length;
+  const lines = v.slice(ls, le).split('\n');
+  const out = lines.map((l, k) => makePrefix(k) + l).join('\n');
+  t.setSelectionRange(ls, le);
+  replaceSelection(t, out, 0, out.length);
+}
+
+function applyFormat(kind) {
+  const t = $('md-text');
+  switch (kind) {
+    case 'bold': wrapSelection(t, '**', '**', 'bold text'); break;
+    case 'italic': wrapSelection(t, '*', '*', 'italic text'); break;
+    case 'strike': wrapSelection(t, '~~', '~~', 'struck text'); break;
+    case 'code': wrapSelection(t, '`', '`', 'code'); break;
+    case 'codeblock': {
+      const atLineStart = t.selectionStart === 0 || t.value[t.selectionStart - 1] === '\n';
+      wrapSelection(t, (atLineStart ? '' : '\n') + '```\n', '\n```\n', 'code');
+      break;
+    }
+    case 'link': {
+      const sel = t.value.slice(t.selectionStart, t.selectionEnd);
+      if (safeUrl(sel)) {
+        replaceSelection(t, '[link text](' + sel + ')', 1, 10);
+      } else {
+        const label = sel || 'link text';
+        const text = '[' + label + '](https://)';
+        replaceSelection(t, text, label.length + 3, label.length + 11);
+      }
+      break;
+    }
+    case 'heading': prefixLines(t, () => '## '); break;
+    case 'quote': prefixLines(t, () => '> '); break;
+    case 'ul': prefixLines(t, () => '- '); break;
+    case 'ol': prefixLines(t, (k) => (k + 1) + '. '); break;
+    case 'hr': replaceSelection(t, '\n\n---\n\n', 7, 7); break;
+    default: break;
+  }
+}
+
+async function sendFromEditor() {
+  const b = $('md-send');
+  b.disabled = true;
+  try {
+    if (await sendBody($('md-text').value, $('md-note'))) closeEditor('sent');
+  } finally {
+    b.disabled = false;
+  }
+}
+
+function wireEditor() {
+  const d = $('md-dialog');
+  $('btn-editor').addEventListener('click', openEditor);
+  $('md-toolbar').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-md]');
+    if (btn && !btn.disabled) applyFormat(btn.dataset.md);
+  });
+  $('md-view').addEventListener('click', () => setEditorPreview(!editor.preview));
+  $('md-send').addEventListener('click', sendFromEditor);
+  $('md-back').addEventListener('click', () => closeEditor('back'));
+  $('md-cancel').addEventListener('click', () => closeEditor('discard'));
+  d.addEventListener('close', onEditorClosed);
+  d.addEventListener('keydown', (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (!mod) return;
+    const k = e.key.toLowerCase();
+    if (k === 'enter') { e.preventDefault(); sendFromEditor(); }
+    else if (k === 'p') { e.preventDefault(); setEditorPreview(!editor.preview); }
+    else if (!editor.preview && (k === 'b' || k === 'i' || k === 'k')) {
+      e.preventDefault();
+      applyFormat(k === 'b' ? 'bold' : k === 'i' ? 'italic' : 'link');
+    }
+  });
 }
 
 /* ---------- room controls ---------- */
@@ -951,6 +1578,12 @@ function wire() {
   $('btn-archive').addEventListener('click', doArchive);
   $('btn-notify').addEventListener('click', toggleNotify);
   $('btn-mute').addEventListener('click', toggleMute);
+  $('btn-md').addEventListener('click', toggleMarkdownView);
+  $('btn-archived').addEventListener('click', toggleArchived);
+  $('btn-new-room').addEventListener('click', () => showNewRoom($('new-room').hidden));
+  $('nr-cancel').addEventListener('click', () => { $('new-room').reset(); showNewRoom(false); });
+  $('new-room').addEventListener('submit', (e) => { e.preventDefault(); createRoom(); });
+  wireEditor();
   $('btn-logout').addEventListener('click', () => signOut(''));
   $('btn-rooms').addEventListener('click', () => document.body.classList.toggle('show-rooms'));
   $('btn-people').addEventListener('click', () => document.body.classList.toggle('show-people'));
@@ -959,6 +1592,8 @@ function wire() {
 async function boot() {
   wire();
   loadNotifyPrefs();
+  loadView();
+  updateMdButton();
   updateNotifyUi();
   state.creds = loadCreds();
   if (!state.creds) { signOut(''); return; }

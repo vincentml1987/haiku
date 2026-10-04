@@ -13,6 +13,7 @@
     <span id="brand">HAIKU</span>
     <span id="whoami"></span>
     <button id="btn-people" type="button" aria-label="Show people">People</button>
+    <button id="btn-md" type="button" aria-pressed="true" title="Show messages rendered as markdown, or as the raw text that was sent.">Markdown: on</button>
     <button id="btn-notify" type="button" aria-pressed="false">Notify: off</button>
     <button id="btn-logout" type="button">Sign out</button>
   </header>
@@ -26,7 +27,29 @@
   </div>
 
   <main id="layout" hidden>
-    <nav id="rooms" aria-label="Rooms"></nav>
+    <nav id="rooms-pane" aria-label="Rooms">
+      <div id="rooms-tools">
+        <button id="btn-new-room" type="button">New room</button>
+        <button id="btn-archived" type="button" aria-pressed="false">Show archived</button>
+      </div>
+      <form id="new-room" hidden>
+        <label>Name <input id="nr-name" maxlength="64" required autocomplete="off"></label>
+        <label>Topic <input id="nr-topic" maxlength="200" autocomplete="off"></label>
+        <label>Who may join
+          <select id="nr-mode">
+            <option value="closed">Closed: invited only</option>
+            <option value="open">Open: anyone</option>
+          </select>
+        </label>
+        <label>AI replies before pause <input id="nr-hops" type="number" min="1" max="100" value="6"></label>
+        <div class="nr-buttons">
+          <button type="submit" id="nr-create">Create</button>
+          <button type="button" id="nr-cancel">Cancel</button>
+        </div>
+        <div id="nr-note" class="muted"></div>
+      </form>
+      <div id="rooms"></div>
+    </nav>
     <section id="room" aria-label="Room">
       <div id="empty">Pick a room on the left.</div>
       <div id="room-view" hidden>
@@ -52,7 +75,10 @@
           <div id="to-effect"></div>
           <div id="compose-row">
             <textarea id="compose" rows="2" aria-label="Message" placeholder="Message the room"></textarea>
-            <button id="btn-send" type="submit">Send</button>
+            <div id="compose-buttons">
+              <button id="btn-send" type="submit">Send</button>
+              <button id="btn-editor" type="button" title="Open the markdown editor, with formatting tools and a preview.">Editor</button>
+            </div>
           </div>
           <div id="compose-note"></div>
         </form>
@@ -61,6 +87,38 @@
     <aside id="people" aria-label="People"></aside>
   </main>
 </div>
+
+<dialog id="md-dialog" aria-labelledby="md-title">
+  <div id="md-form">
+    <div id="md-head">
+      <strong id="md-title">Markdown editor</strong>
+      <span id="md-to" class="muted"></span>
+    </div>
+    <div id="md-toolbar" role="toolbar" aria-label="Formatting">
+      <button type="button" data-md="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+      <button type="button" data-md="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+      <button type="button" data-md="strike" title="Strikethrough"><s>S</s></button>
+      <button type="button" data-md="heading" title="Heading">H</button>
+      <button type="button" data-md="code" title="Inline code">`code`</button>
+      <button type="button" data-md="codeblock" title="Code block">```</button>
+      <button type="button" data-md="link" title="Link (Ctrl+K)">Link</button>
+      <button type="button" data-md="quote" title="Quote">&gt; Quote</button>
+      <button type="button" data-md="ul" title="Bulleted list">&bull; List</button>
+      <button type="button" data-md="ol" title="Numbered list">1. List</button>
+      <button type="button" data-md="hr" title="Divider">&mdash;</button>
+      <span class="md-spacer"></span>
+      <button type="button" id="md-view" aria-pressed="false" title="Switch between the markdown source and how it will look (Ctrl+P)">Preview</button>
+    </div>
+    <textarea id="md-text" rows="14" aria-label="Message (markdown)"></textarea>
+    <div id="md-preview" class="md" hidden></div>
+    <div id="md-foot">
+      <span id="md-note" class="muted">Ctrl+Enter sends.</span>
+      <button type="button" id="md-back" title="Close the editor and put this text back in the quick box">Back to quick box</button>
+      <button type="button" id="md-cancel">Discard</button>
+      <button type="button" id="md-send">Send</button>
+    </div>
+  </div>
+</dialog>
 <script src="/ui/app.js"></script>
 </body>
 </html>
