@@ -316,6 +316,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Security-Policy", CSP)
+        # API responses too, not just static UI files (Tessera's review,
+        # 2026-10-04): a JSON body carrying participant text must never be
+        # content-sniffed into something a browser would render or run.
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             self.wfile.write(data)
