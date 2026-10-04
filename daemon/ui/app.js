@@ -527,6 +527,7 @@ function signOut(message) {
   try { localStorage.removeItem(LS_KEY); } catch (e) { /* ignore */ }
   state.creds = null;
   stopPolling();
+  clearAttachCache();
   $('layout').hidden = true;
   $('signin').hidden = false;
   $('whoami').textContent = '';
@@ -893,6 +894,7 @@ async function openRoom(id) {
   // Uploads belong to one room; unsent ones the daemon expires on its own.
   state.pending = [];
   renderPending();
+  if (id !== state.attachRoom) { clearAttachCache(); state.attachRoom = id; }
   state.stickToBottom = true;
   state.unseenBelow = 0;
   state.bannerKey = null;
@@ -1163,6 +1165,7 @@ function dividerNode() {
 
 function renderStream() {
   const s = $('stream');
+  if (imageObserver) imageObserver.disconnect(); // old image nodes are about to go
   clear(s);
   for (const ev of state.events) {
     s.appendChild(eventNode(ev));
@@ -1479,7 +1482,40 @@ async function sendCurrent() {
 
 const ATTACH_MAX_BYTES = 20 * 1024 * 1024;
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-const attachCache = new Map(); // "room/att" -> Promise<data URL>
+// "room/att" -> Promise<blob: URL>. Blob URLs (not data: URLs) so memory can
+// be freed: the cache is capped, and cleared on room switch and sign-out so
+// private files don't linger (Tessera's review). Images load lazily, and
+// ones over IMAGE_AUTO_BYTES wait for a click.
+const attachCache = new Map();
+const ATTACH_CACHE_MAX = 60;
+const IMAGE_AUTO_BYTES = 2 * 1024 * 1024;
+
+function revokeCached(p) {
+  p.then((url) => URL.revokeObjectURL(url)).catch(() => { /* never loaded */ });
+}
+
+function clearAttachCache() {
+  for (const p of attachCache.values()) revokeCached(p.then((r) => r.url));
+  attachCache.clear();
+}
+
+let imageObserver = null;
+function observeImage(node, load) {
+  if (typeof IntersectionObserver === 'undefined') { load(); return; }
+  if (!imageObserver) {
+    imageObserver = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        imageObserver.unobserve(en.target);
+        const fn = en.target._haikuLoad;
+        en.target._haikuLoad = null;
+        if (fn) fn();
+      }
+    }, { root: $('stream'), rootMargin: '400px 0px' });
+  }
+  node._haikuLoad = load;
+  imageObserver.observe(node);
+}
 
 function fmtSize(n) {
   if (!Number.isFinite(n)) return '';
@@ -1562,24 +1598,31 @@ function renderPending() {
   }
 }
 
+// Resolves to { url, type }: a blob: URL for the file and the type the
+// daemon served it as.
 function fetchAttachment(roomId, att) {
   const key = roomId + '/' + att.id;
-  if (attachCache.has(key)) return attachCache.get(key);
+  if (attachCache.has(key)) {
+    const hit = attachCache.get(key);
+    attachCache.delete(key);       // re-insert: Map order doubles as LRU order
+    attachCache.set(key, hit);
+    return hit;
+  }
   const p = (async () => {
     const res = await fetch('/rooms/' + encodeURIComponent(roomId) + '/attachments/' + encodeURIComponent(att.id), {
       headers: { 'X-Haiku-Participant': state.creds.name, 'X-Haiku-Token': state.creds.token },
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const blob = await res.blob();
-    return await new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(String(r.result));
-      r.onerror = () => reject(new Error('could not read file'));
-      r.readAsDataURL(blob);
-    });
+    return { url: URL.createObjectURL(blob), type: blob.type };
   })();
   attachCache.set(key, p);
   p.catch(() => attachCache.delete(key));
+  while (attachCache.size > ATTACH_CACHE_MAX) {
+    const [oldKey, oldP] = attachCache.entries().next().value;
+    attachCache.delete(oldKey);
+    revokeCached(oldP.then((r) => r.url));
+  }
   return p;
 }
 
@@ -1597,11 +1640,26 @@ function attachmentsNode(atts) {
       img.title = 'Click to enlarge or shrink';
       img.addEventListener('click', () => img.classList.toggle('big'));
       const status = el('span', { cls: 'meta', text: 'loading…' });
+      const load = () => {
+        status.textContent = 'loading…';
+        fetchAttachment(roomId, a).then((r) => {
+          // Only ever show what the daemon served as one of the four image types.
+          if (IMAGE_MIMES.has(r.type)) { img.src = r.url; status.remove(); } else status.textContent = 'not an image';
+        }).catch((e) => { status.textContent = 'could not load (' + e.message + ')'; });
+      };
       fig.appendChild(img);
       fig.appendChild(el('figcaption', null, [label, size, status]));
-      fetchAttachment(roomId, a).then((url) => {
-        if (url.startsWith('data:image/')) { img.src = url; status.remove(); } else status.textContent = 'not an image';
-      }).catch((e) => { status.textContent = 'could not load (' + e.message + ')'; });
+      if (Number(a.size) > IMAGE_AUTO_BYTES) {
+        status.textContent = '';
+        img.hidden = true;
+        const show = el('button', {
+          type: 'button', cls: 'att-download', text: 'Show image (' + fmtSize(a.size) + ')',
+          on: { click: () => { show.remove(); img.hidden = false; load(); } },
+        });
+        fig.insertBefore(show, img);
+      } else {
+        observeImage(fig, load);
+      }
       box.appendChild(fig);
     } else {
       const btn = el('button', {
@@ -1610,9 +1668,9 @@ function attachmentsNode(atts) {
           click: async () => {
             btn.disabled = true;
             try {
-              const url = await fetchAttachment(roomId, a);
+              const r = await fetchAttachment(roomId, a);
               const link = document.createElement('a');
-              link.href = url;
+              link.href = r.url;
               link.download = safeFilename(a.filename);
               document.body.appendChild(link);
               link.click();
@@ -1648,16 +1706,27 @@ function wireAttachments() {
     input.value = '';
     await uploadFiles(files);
   });
-  // Paste: only intercept when the clipboard holds files (a screenshot);
-  // ordinary text paste is left alone.
+  // Paste: only intercept a clipboard that holds files and NO text (a
+  // screenshot). Excel, Word and many pages put an image beside the text;
+  // then the text paste wins and nothing is uploaded.
   for (const id of ['compose', 'md-text']) {
     $(id).addEventListener('paste', (e) => {
-      const files = filesFromTransfer(e.clipboardData);
+      const dt = e.clipboardData;
+      if (dt && [...dt.types].includes('text/plain')) return;
+      const files = filesFromTransfer(dt);
       if (!files.length) return;
       e.preventDefault();
       uploadFiles(files);
     });
   }
+  // A file dropped anywhere outside the two drop zones would make the
+  // browser navigate away from HAIKU to open it. Swallow file drags there.
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault();
+  });
+  window.addEventListener('drop', (e) => {
+    if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault();
+  });
   for (const id of ['composer', 'md-dialog']) {
     const zone = $(id);
     zone.addEventListener('dragover', (e) => {
