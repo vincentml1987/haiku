@@ -60,18 +60,27 @@ const POST_TOOLS: Array<{ tool: string; input: Record<string, unknown> }> = [
   { tool: 'mcp__haiku__haiku_mute', input: { room_id: 'r1', muted: true } },
 ]
 
-// 2026-10-04 mute: catch-up (prompt.submit) skips a muted room without
-// acking, and still delivers it when a human got through (owes set).
-function catchUpRig(on: any, owes: number | null) {
+// 2026-10-04 mute: catch-up (prompt.submit) stays silent on a muted room
+// without acking, and still delivers it when an unseen human message is
+// addressed to this AI by name. The daemon's owes_reply_to_seq is null in
+// both cases on purpose: a later human message to someone else clears it,
+// so the breakthrough must not depend on it (Tessera's review of 3f88169).
+function catchUpRig(on: any, addressedTo: string[] | null) {
   const paths: string[] = []
   const appended: string[] = []
   on('http.fetch', (_$: any, e: any) => {
     const url = String(e.url)
     paths.push(`${e.init.method} ${url.replace('http://fake-daemon.invalid', '').split('?')[0]}`)
     let body: unknown = {}
-    if (url.includes('/me/rooms')) body = { rooms: [{ id: 'r1', state: 'active', owes_reply_to_seq: owes, muted: true }], pending_invites: [] }
-    else if (url.includes('/events')) body = { events: [{ seq: 3, ts: '2026-10-04T00:00:00Z', author: 'Teddy', author_kind: 'human', type: 'message', addressed_to: ['TestAI'], body: 'hi' }], max_seq: 3 }
-    else if (url.endsWith('/rooms/r1')) body = { id: 'r1', name: 'room', topic: null, state: 'active', hop_count: 0, hop_limit: 6, roster: [{ participant: 'TestAI', owes_reply_to_seq: owes }] }
+    if (url.includes('/me/rooms')) body = { rooms: [{ id: 'r1', state: 'active', owes_reply_to_seq: null, muted: true }], pending_invites: [] }
+    else if (url.includes('/events')) body = {
+      events: [
+        { seq: 3, ts: '2026-10-04T00:00:00Z', author: 'Teddy', author_kind: 'human', type: 'message', addressed_to: addressedTo, body: 'hi' },
+        { seq: 4, ts: '2026-10-04T00:00:01Z', author: 'Teddy', author_kind: 'human', type: 'message', addressed_to: ['Other'], body: 'and you' },
+      ],
+      max_seq: 4,
+    }
+    else if (url.endsWith('/rooms/r1')) body = { id: 'r1', name: 'room', topic: null, state: 'active', hop_count: 0, hop_limit: 6, roster: [{ participant: 'TestAI', owes_reply_to_seq: null }] }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } }
   })
   on('session.append', (_$: any, e: any) => {
@@ -82,23 +91,24 @@ function catchUpRig(on: any, owes: number | null) {
   return { paths, appended }
 }
 
-test('catch-up skips a muted room and does not ack it', { options: OPTIONS }, async ($, on) => {
+test('catch-up stays silent on a muted room and does not ack it', { options: OPTIONS }, async ($, on) => {
   mock.store(on, { 'joinedRooms:TestAI': [{ id: 'r1', name: 'room' }] })
-  const { paths, appended } = catchUpRig(on, null)
+  const { paths, appended } = catchUpRig(on, ['all'])
   await $.prompt.submit({ text: 'hello' } as any)
   expect(appended.length).toBe(0)
-  expect(paths.some(p => p.includes('/events') || p.includes('/ack'))).toBe(false)
+  expect(paths.some(p => p.includes('/ack'))).toBe(false)
+  expect(paths.includes('GET /rooms/r1')).toBe(false)
 })
 
-test('catch-up still delivers a muted room when a human addressed this AI', { options: OPTIONS }, async ($, on) => {
+test('a human addressing this AI breaks through a mute even after owes was cleared', { options: OPTIONS }, async ($, on) => {
   mock.store(on, { 'joinedRooms:TestAI': [{ id: 'r1', name: 'room' }] })
-  const { paths } = catchUpRig(on, 3)
+  const { paths } = catchUpRig(on, ['TestAI'])
   await $.prompt.submit({ text: 'hello' } as any)
-  // Not skipped: catch-up goes on to read the room's events. (Whether the
-  // append itself lands is the pre-existing delivery path, not the mute
-  // logic; this rig's session.append stub is never reached in the test
-  // engine, so it is not asserted here.)
-  expect(paths.includes('GET /rooms/r1/events')).toBe(true)
+  // Not skipped: catch-up goes on to build the delivery (fetches the room).
+  // Whether the append itself lands is the pre-existing delivery path, not
+  // the mute logic; this rig's session.append stub is never reached in the
+  // test engine, so it is not asserted here.
+  expect(paths.includes('GET /rooms/r1')).toBe(true)
 })
 
 for (const { tool, input } of POST_TOOLS) {

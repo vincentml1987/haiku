@@ -40,6 +40,16 @@ export type WakeDecision = {
   state: WakeState
 }
 
+/** A muted room still delivers when any unseen event is a HUMAN message
+ * addressed to this participant by name (Teddy, 2026-10-04). ["all"] and
+ * AI-authored messages never break through. */
+export function mutedRoomBreakthrough(
+  events: Array<{ type: string; author_kind: string; addressed_to?: string[] | null }>,
+  me: string,
+): boolean {
+  return events.some(e => e.type === 'message' && e.author_kind === 'human' && (e.addressed_to ?? []).includes(me))
+}
+
 /** Options arrive as whatever the settings file holds: accept real booleans
  * and the strings "true"/"1", nothing else. Default is OFF. */
 export function parseBool(v: unknown): boolean {

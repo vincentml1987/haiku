@@ -1,6 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import {
   decideWake,
+  mutedRoomBreakthrough,
   parseBool,
   parseSeconds,
   EMPTY_WAKE_STATE,
@@ -75,6 +76,17 @@ test('a room whose per-room wake Teddy turned off never wakes; other rooms still
   expect(d.wake).toBe(true)
   expect(d.state.wokenSeq.r1).toBe(undefined)
   expect(d.state.wokenSeq.r2).toBe(4)
+})
+
+test('mute breakthrough: only a human message addressed to me by name', async () => {
+  const ev = (author_kind: string, addressed_to: string[] | null, type = 'message') => ({ type, author_kind, addressed_to })
+  expect(mutedRoomBreakthrough([ev('human', ['Me'])], 'Me')).toBe(true)
+  expect(mutedRoomBreakthrough([ev('human', ['Other', 'Me'])], 'Me')).toBe(true)
+  expect(mutedRoomBreakthrough([ev('human', ['all'])], 'Me')).toBe(false)
+  expect(mutedRoomBreakthrough([ev('human', null)], 'Me')).toBe(false)
+  expect(mutedRoomBreakthrough([ev('ai', ['Me'])], 'Me')).toBe(false)
+  expect(mutedRoomBreakthrough([ev('human', ['Me'], 'topic_change')], 'Me')).toBe(false)
+  expect(mutedRoomBreakthrough([], 'Me')).toBe(false)
 })
 
 test('option parsing: autoWake defaults OFF, poll has a floor', async () => {

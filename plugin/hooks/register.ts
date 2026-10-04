@@ -46,6 +46,7 @@ import {
   parseBool,
   parseSeconds,
   decideWake,
+  mutedRoomBreakthrough,
 } from './wake'
 
 /**
@@ -191,30 +192,25 @@ async function catchUp($: Engine, c: HaikuCreds) {
   const fetch = makeFetch($, c)
   const rooms = await getJoinedRooms($, c.participantName)
   if (rooms.length === 0) return
-  // Muted rooms (2026-10-04) are skipped unless a human got through by
-  // addressing this AI by name (then owes_reply_to_seq is set). Skipping
-  // does NOT ack: the cursor stays put, so haiku_read with no since= still
-  // shows everything unseen whenever the AI chooses to look.
-  let muted = new Map<string, boolean>()
+  let muted = new Set<string>()
   try {
     const me = (await fetch('GET', '/me/rooms')) as MeRooms
-    muted = new Map(me.rooms.map(r => [r.id, !!r.muted && r.owes_reply_to_seq == null]))
+    muted = new Set(me.rooms.filter(r => r.muted).map(r => r.id))
   } catch {
     // older daemon or a hiccup: deliver as before rather than go silent
   }
   for (const room of rooms) {
-    if (muted.get(room.id)) continue
     // One room's failure (daemon hiccup, room archived mid-session, a bad
     // append) must not abort every later room's catch-up.
     try {
-      await catchUpOneRoom($, fetch, c, room)
+      await catchUpOneRoom($, fetch, c, room, muted.has(room.id))
     } catch {
       continue
     }
   }
 }
 
-async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c: HaikuCreds, room: JoinedRoom) {
+async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c: HaikuCreds, room: JoinedRoom, muted = false) {
   const since = await getLastSeen($, c.participantName, room.id)
   const batch = (await readEvents(fetch, room.id, { since, advance: false, excludeSelf: true })) as {
     events: HaikuEvent[]
@@ -231,6 +227,13 @@ async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c:
     await setLastSeen($, c.participantName, room.id, batch.max_seq)
     return
   }
+  // Muted (2026-10-04): stay silent and do NOT ack, so the cursor stays put
+  // and haiku_read with no since= still shows everything unseen whenever the
+  // AI chooses to look. Exception: an unseen human message addressed to this
+  // AI by name breaks through. Keyed on the events themselves, not on
+  // owes_reply_to_seq, which a later human message to someone else clears
+  // (Tessera's review of 3f88169: that race could drop the breakthrough).
+  if (muted && !mutedRoomBreakthrough(batch.events, c.participantName)) return
 
   const roomInfo = await getRoom(fetch, room.id)
   const myRoster = (roomInfo.roster as any[]).find(r => r.participant === c.participantName)
