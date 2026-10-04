@@ -191,6 +191,21 @@ def main():
         check("human can lift the restriction",
               {r["participant"]: r["room_wake_allowed"] for r in db.room_roster(conn, room)}["Bo"] is True)
 
+        # ---------- names (review of 48b9c26): invisible Unicode rejected for NEW names
+        for label, bad in (("bidi override U+202E", "ab\u202ecd"), ("line separator U+2028", "a\u2028b"),
+                           ("paragraph separator U+2029", "a\u2029b"), ("C1 control U+0085", "a\u0085b"),
+                           ("zero-width space U+200B", "a\u200bb"), ("zero-width joiner U+200D", "a\u200db"),
+                           ("BOM/ZWNBSP U+FEFF", "a\ufeffb"), ("newline", "a\nb"), ("angle bracket", "a<b")):
+            check(f"participant name with {label} is rejected", raises(db.HaikuError, db.register_ai, conn, bad))
+            check(f"room name with {label} is rejected",
+                  raises(db.HaikuError, db.create_room, conn, bad, "Ann", a, mode="open"))
+        check("ordinary names with spaces, digits and punctuation are still accepted",
+              isinstance(db.register_ai(conn, "Dee-2 (test)"), str))
+        check("non-ASCII letters are still accepted as names (only the wake notice narrows them)",
+              isinstance(db.register_ai(conn, "Zo\u00eb"), str))
+        check("a 64-char name is accepted and a 65-char name rejected",
+              isinstance(db.register_ai(conn, "N" * 64), str) and raises(db.HaikuError, db.register_ai, conn, "N" * 65))
+
         print("\nall review checks passed")
     finally:
         conn.close()
