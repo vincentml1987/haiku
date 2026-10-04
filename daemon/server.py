@@ -377,6 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ClientError(400, "invalid Content-Length")
         if length > MAX_BODY_BYTES:
             raise ClientError(413, f"body exceeds {MAX_BODY_BYTES} bytes")
+        self._body_consumed = True  # from here on, never drain: the read has begun
         try:
             raw = self.rfile.read(length) if length else b"{}"
         except (socket.timeout, TimeoutError):
@@ -406,9 +407,12 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             return self._guarded(self._attachment_get, m.group("room_id"), m.group("att_id"))
 
+        self._body_consumed = False
         try:
             body = self._read_json_body()
         except ClientError as e:
+            if not self._body_consumed:
+                self._drain_small_body()
             return self._respond(e.status, {"error": e.message})
 
         for route_method, pattern, handler in ROUTES:
@@ -433,16 +437,37 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond(404, {"error": "no such route"})
 
+    DRAIN_MAX = 64 * 1024
+
+    def _drain_small_body(self):
+        """Before answering an early rejection, read and discard a SMALL
+        unread body. Closing a socket with unread data makes Windows send a
+        reset that can destroy the reply before the client reads it (seen as
+        an intermittent test_server failure on 2026-10-04). Large bodies are
+        not drained: refusing to spend time on them is the point."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if 0 < n <= self.DRAIN_MAX:
+            try:
+                self.rfile.read(n)
+            except (OSError, ValueError):
+                pass
+
     def _guarded(self, fn, *args):
-        """Same error mapping as the JSON routes, for the binary ones."""
+        """Same error mapping as the JSON routes, for the binary ones. An
+        upload refused before its body was read drains a small body first
+        (see _drain_small_body); _attachment_upload marks when it has read."""
+        self._body_consumed = False
         try:
             return fn(*args)
-        except ClientError as e:
-            return self._respond(e.status, {"error": e.message})
-        except db.Forbidden as e:
-            return self._respond(403, {"error": str(e)})
-        except db.HaikuError as e:
-            return self._respond(400, {"error": str(e)})
+        except (ClientError, db.HaikuError) as e:
+            if not self._body_consumed:
+                self._drain_small_body()
+            if isinstance(e, ClientError):
+                return self._respond(e.status, {"error": e.message})
+            return self._respond(403 if isinstance(e, db.Forbidden) else 400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             print(f"[haiku daemon] internal error on attachment {self.path}: {e!r}", file=sys.stderr)
             return self._respond(500, {"error": "internal error"})
@@ -472,6 +497,7 @@ class Handler(BaseHTTPRequestHandler):
         # review: one byte every 9 s would otherwise hold the daemon for ages).
         deadline = time.monotonic() + ATTACH_READ_DEADLINE_S
         chunks, got = [], 0
+        self._body_consumed = True  # from here on, never drain: the read has begun
         try:
             while got < length:
                 if time.monotonic() > deadline:
@@ -484,6 +510,7 @@ class Handler(BaseHTTPRequestHandler):
         except (socket.timeout, TimeoutError):
             raise ClientError(408, "upload timed out")
         data = b"".join(chunks)
+        self._body_consumed = True
         if len(data) != length:
             raise ClientError(400, "upload was cut short")
         att = db.upload_attachment(self.conn, self.store_dir, room_id, participant, token, filename, data)
