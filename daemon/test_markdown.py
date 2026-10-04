@@ -173,7 +173,7 @@ def main():
         cmd = [chrome, "--headless=new", "--disable-gpu", f"--user-data-dir={profile}",
                "--virtual-time-budget=120000", "--dump-dom", Path(page).as_uri()]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         except subprocess.TimeoutExpired:
             check("the renderer finished all cases within 120 s (a hang means quadratic cost is back)", False)
         dom = proc.stdout
