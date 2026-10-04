@@ -136,3 +136,86 @@ for (const { tool, input } of POST_TOOLS) {
     }
   })
 }
+
+
+// 2026-10-04 context reminders (eot-initialization-automation): the usage
+// read in contextReminder, not only the pure rules in reminder.ts. The test
+// engine never routes `$.session.append` to a stub (see the catch-up test
+// above), so what is asserted is what contextReminder persists: the reading
+// log and the fired-thresholds state. `fired` growing is the same decision
+// that produces the injected line.
+function reminderRig(on: any, reading: { startedAt: number; percent: number | undefined }) {
+  const store = new Map<string, any>()
+  on('store.get', (_$: any, e: any) => ({ value: store.get(e.key) }))
+  on('store.set', (_$: any, e: any) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  mock.clock(on, { now: 1000 })
+  on('session.usage', () => ({
+    value: {
+      startedAt: reading.startedAt,
+      context: { tokens: 1000, window: 200000, percent: reading.percent },
+      rateLimits: [],
+    },
+  }))
+  on('session.append', () => ({ value: { isDelivered: true } }))
+  on('prompt.submit', (_$: any, e: any) => ({ text: String(e.text) }))
+  return {
+    state: () => store.get('reminderState:TestAI') as { sessionKey: number; fired: number[] } | undefined,
+    log: () => (store.get('contextReadings:TestAI') ?? []) as Array<{ session: number; percent: number }>,
+  }
+}
+
+test('contextReminder logs each reading and marks a crossed threshold fired once', { options: OPTIONS }, async ($, on) => {
+  const reading = { startedAt: 100, percent: 65 as number | undefined }
+  const rig = reminderRig(on, reading)
+  await $.prompt.submit({ text: 'hello' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [60] })
+  expect(rig.log().length).toBe(1)
+  expect(rig.log()[0].percent).toBe(65)
+  // same threshold again: still fired once, but the reading is logged
+  await $.prompt.submit({ text: 'again' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [60] })
+  expect(rig.log().length).toBe(2)
+  // next threshold crossed
+  reading.percent = 80
+  await $.prompt.submit({ text: 'later' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [60, 75] })
+})
+
+test('contextReminder does nothing below the first threshold, and skips a missing percent without logging', { options: OPTIONS }, async ($, on) => {
+  const reading = { startedAt: 100, percent: undefined as number | undefined }
+  const rig = reminderRig(on, reading)
+  await $.prompt.submit({ text: 'a' } as any)
+  expect(rig.state()).toBe(undefined)
+  expect(rig.log().length).toBe(0)
+  reading.percent = 40
+  await $.prompt.submit({ text: 'b' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [] })
+  expect(rig.log().length).toBe(1)
+})
+
+test('contextReminder: a new session start (after /clear) starts the fired list over', { options: OPTIONS }, async ($, on) => {
+  const reading = { startedAt: 100, percent: 90 as number | undefined }
+  const rig = reminderRig(on, reading)
+  await $.prompt.submit({ text: 'a' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [60, 75, 85] })
+  reading.startedAt = 200
+  reading.percent = 62
+  await $.prompt.submit({ text: 'b' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 200, fired: [60] })
+})
+
+test('contextReminder: reminderThresholds "off" disables it and logs nothing', { options: { ...OPTIONS, reminderThresholds: 'off' } }, async ($, on) => {
+  const rig = reminderRig(on, { startedAt: 100, percent: 95 })
+  await $.prompt.submit({ text: 'a' } as any)
+  expect(rig.state()).toBe(undefined)
+  expect(rig.log().length).toBe(0)
+})
+
+test('contextReminder: a custom threshold list is honored', { options: { ...OPTIONS, reminderThresholds: '10,50' } }, async ($, on) => {
+  const rig = reminderRig(on, { startedAt: 100, percent: 55 })
+  await $.prompt.submit({ text: 'a' } as any)
+  expect(rig.state()).toEqual({ sessionKey: 100, fired: [10, 50] })
+})
