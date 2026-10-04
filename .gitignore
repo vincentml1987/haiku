@@ -5,6 +5,7 @@ daemon/*.db-wal
 daemon/*.db-shm
 daemon/*.admin_secret
 daemon/*.backup-before-migration-*
+daemon/*.backup-before-restart-*
 
 # Python
 __pycache__/
