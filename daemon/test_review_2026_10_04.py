@@ -206,6 +206,83 @@ def main():
         check("a 64-char name is accepted and a 65-char name rejected",
               isinstance(db.register_ai(conn, "N" * 64), str) and raises(db.HaikuError, db.register_ai, conn, "N" * 65))
 
+        # ---------- item 8: attachments (review of 66202c3) -------------------
+        PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
+        store = os.path.join(tmp, "attachments")
+        arm = db.create_room(conn, "attach-room", "Ann", a, mode="open")
+        for who, tok in (("Bo", b), ("Teddy", t)):
+            db.join_room(conn, arm, who, tok)
+
+        def up(name, data, who="Ann", tk=a, rm=None):
+            return db.upload_attachment(conn, store, rm or arm, who, tk, name, data)
+
+        att = up("shot.png", PNG)
+        check("a valid PNG is stored under a random 32-hex id with a sniffed extension",
+              len(att["id"]) == 32 and att["local_path"].endswith(att["id"] + ".png") and os.path.isfile(att["local_path"]))
+        for label, name, data in (("html renamed .png", "a.png", b"<html></html>"), ("html", "a.html", b"<html></html>"),
+                                  ("svg", "a.svg", b"<svg onload=1/>"), ("double extension", "a.png.exe", PNG),
+                                  ("NUL in text", "a.txt", b"hi\x00there"), ("invalid json", "a.json", b"{nope")):
+            check(f"upload refused: {label}", raises(db.HaikuError, up, name, data))
+        check("a traversal-style filename is stored harmlessly under a random id",
+              os.path.dirname(up("..\\..\\evil.png", PNG)["local_path"]) == os.path.dirname(att["local_path"]))
+        check("a non-member cannot upload", raises(db.Forbidden, up, "o.png", PNG, "Out", outsider))
+        check("an upload cannot be bound by someone else",
+              raises(db.HaikuError, db.send_message, conn, arm, "Bo", b, "stolen", attachment_ids=[att["id"]]))
+        other = db.create_room(conn, "attach-other", "Ann", a, mode="open")
+        check("an upload cannot be bound in another room",
+              raises(db.HaikuError, db.send_message, conn, other, "Ann", a, "wrong room", attachment_ids=[att["id"]]))
+        check("unsent uploads are invisible to other members",
+              raises(db.HaikuError, db.get_attachment, conn, store, arm, att["id"], "Bo", b))
+        db.send_message(conn, arm, "Ann", a, "here", attachment_ids=[att["id"]])
+        check("once sent, a room member can fetch it",
+              db.get_attachment(conn, store, arm, att["id"], "Bo", b)[0]["filename"] == "shot.png")
+        check("a non-member cannot fetch it",
+              raises(db.Forbidden, db.get_attachment, conn, store, arm, att["id"], "Out", outsider))
+        check("an attachment cannot be sent twice",
+              raises(db.HaikuError, db.send_message, conn, arm, "Ann", a, "again", attachment_ids=[att["id"]]))
+
+        # quota: unsent uploads are capped per participant
+        got = 0
+        try:
+            for i in range(db.ATTACH_MAX_UNBOUND + 5):
+                up(f"u{i}.png", PNG, "Bo", b)
+                got += 1
+        except db.HaikuError:
+            pass
+        check(f"unsent uploads are capped per participant ({got} accepted, limit {db.ATTACH_MAX_UNBOUND})",
+              got == db.ATTACH_MAX_UNBOUND)
+        check("one participant's cap does not block another", isinstance(up("t.png", PNG, "Teddy", t), dict))
+        check("an oversize upload is refused before any bytes are needed",
+              raises(db.HaikuError, db.upload_precheck, conn, arm, "Ann", a, db.MAX_ATTACHMENT_BYTES + 1))
+        check("a zero-length upload is refused", raises(db.HaikuError, db.upload_precheck, conn, arm, "Ann", a, 0))
+        db.pause_room(conn, arm, "Teddy", t, "review")
+        check("an AI cannot upload into a paused room (mirrors send_message)",
+              raises(db.HaikuError, up, "p.png", PNG, "Ann", a))
+        check("a human still can in a paused room", isinstance(up("hp.png", PNG, "Teddy", t), dict))
+        db.resume_room(conn, arm, "Teddy", t)
+
+        # sweep: unsent uploads past the TTL go; sent files and fresh unsent uploads stay
+        fresh = up("fresh.png", PNG, "Ann", a)
+        old = up("old.png", PNG, "Ann", a)
+        conn.execute("UPDATE attachments SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-25 hours') WHERE id = ?",
+                     (old["id"],))
+        conn.commit()
+        res = db.sweep_attachments(conn, store)
+        check("sweep removes an unsent upload older than the TTL",
+              not os.path.exists(old["local_path"]) and res["expired"] >= 1)
+        check("sweep keeps a fresh unsent upload", os.path.isfile(fresh["local_path"]))
+        check("sweep never touches a sent file", os.path.isfile(att["local_path"]))
+        stray = os.path.join(store, "0" * 32 + ".png")
+        with open(stray, "wb") as f:
+            f.write(PNG)
+        db.sweep_attachments(conn, store)
+        check("sweep removes an attachment-shaped file that has no row", not os.path.exists(stray))
+        keep = os.path.join(store, "keep-me.txt")
+        with open(keep, "w") as f:
+            f.write("not an attachment")
+        db.sweep_attachments(conn, store)
+        check("sweep leaves a file whose name is not attachment-shaped alone", os.path.exists(keep))
+
         print("\nall review checks passed")
     finally:
         conn.close()
