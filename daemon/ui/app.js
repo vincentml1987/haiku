@@ -1036,6 +1036,8 @@ function renderHead() {
   $('hop-label').textContent = 'AI replies since you spoke: ' + (r.hop_count || 0) + '/' + (r.hop_limit || 6);
   $('btn-pause').hidden = r.state !== 'active';
   $('btn-archive').hidden = r.state === 'archived';
+  // The lobby is where the AIs reach Teddy, so the UI doesn't offer to leave it.
+  $('btn-leave').hidden = String(r.name).toLowerCase() === 'lobby';
   updateNotifyUi();
 
   // The banner holds an input the person may be typing in, so it is only
@@ -1640,6 +1642,37 @@ async function doArchive() {
   } catch (e) { setBanner('Archive failed: ' + e.message); }
 }
 
+async function doLeave() {
+  // Same inline two-click confirm as Archive (no browser dialogs).
+  const b = $('btn-leave');
+  if (b.dataset.armed !== '1') {
+    b.dataset.armed = '1';
+    b.textContent = 'Click again to leave';
+    setTimeout(() => { b.dataset.armed = '0'; b.textContent = 'Leave'; }, 4000);
+    return;
+  }
+  b.dataset.armed = '0';
+  b.textContent = 'Leave';
+  const id = state.roomId;
+  const name = state.room ? state.room.name : '';
+  const closed = !!(state.room && state.room.mode === 'closed');
+  try {
+    await api('POST', '/rooms/' + encodeURIComponent(id) + '/leave', {});
+    stopPolling();
+    state.roomId = null;
+    state.room = null;
+    state.events = [];
+    $('room-view').hidden = true;
+    $('empty').hidden = false;
+    await refreshSummary();
+    state.summaryTimer = setInterval(summaryTick, SUMMARY_MS);
+    setBanner('You left "' + cleanName(name) + '". It is under Other rooms if you want to rejoin.' +
+      (closed ? ' While no human is in this closed room, nobody can invite anyone into it.' : ''));
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401)) setBanner('Leave failed: ' + e.message);
+  }
+}
+
 /* ---------- wiring ---------- */
 
 function wire() {
@@ -1657,6 +1690,7 @@ function wire() {
   });
   $('btn-pause').addEventListener('click', doPause);
   $('btn-archive').addEventListener('click', doArchive);
+  $('btn-leave').addEventListener('click', doLeave);
   $('btn-notify').addEventListener('click', toggleNotify);
   $('btn-mute').addEventListener('click', toggleMute);
   $('btn-md').addEventListener('click', toggleMarkdownView);
