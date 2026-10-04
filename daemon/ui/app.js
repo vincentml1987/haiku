@@ -991,6 +991,7 @@ async function pollOnce() {
     if (Date.now() - state.wakeLoadedAt > 30000) await loadWake();
     renderHead();
     renderPeople();
+    refreshToChips();
     renderComposerEffect();
     maybeAck();
     pollFailures = 0;
@@ -1401,7 +1402,16 @@ function toggleTo(name) {
   renderComposerEffect();
 }
 
+// A poll tick rebuilds the To: chips only when the set of AIs changed, so a
+// participant who joins while the room is open shows up without a reload.
+let toChipsKey = null;
+function refreshToChips() {
+  const key = state.roomId + '|' + aiRoster().map((p) => p.participant).join(',');
+  if (key !== toChipsKey) renderToChips();
+}
+
 function renderToChips() {
+  toChipsKey = state.roomId + '|' + aiRoster().map((p) => p.participant).join(',');
   const box = $('to-chips');
   clear(box);
   box.appendChild(el('button', {
