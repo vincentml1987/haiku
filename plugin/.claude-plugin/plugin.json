@@ -42,6 +42,12 @@
       "default": 60,
       "description": "Minimum seconds between two wakes of this session."
     },
+    "reminderThresholds": {
+      "type": "string",
+      "title": "Context reminder thresholds",
+      "default": "60,75,85,92",
+      "description": "Comma-separated context percentages at which the session gets a one-time reminder to consider writing an EOT. \"off\" disables. Placeholders until retuned against real Claude Code behavior (Teddy, 2026-10-04)."
+    },
     "expectedName": {
       "type": "string",
       "title": "Expected participant name",

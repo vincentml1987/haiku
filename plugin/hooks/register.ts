@@ -48,6 +48,7 @@ import {
   decideWake,
   mutedRoomBreakthrough,
 } from './wake'
+import { type ReminderState, EMPTY_REMINDER_STATE, parseThresholds, decideReminder } from './reminder'
 
 /**
  * Builds the fetch closure client.ts's functions take. $.http.fetch is
@@ -107,7 +108,7 @@ type JoinedRoom = { id: string; name: string }
  * identity — cheap, and correct regardless of how the scope question
  * (Vero's review, item 3) actually resolves once verified empirically.
  */
-function storeKey(kind: 'joinedRooms' | 'lastSeenSeq' | 'wakeState' | 'autoWakeSession', participantName: string): string {
+function storeKey(kind: 'joinedRooms' | 'lastSeenSeq' | 'wakeState' | 'autoWakeSession' | 'reminderState' | 'contextReadings', participantName: string): string {
   return `${kind}:${participantName}`
 }
 
@@ -259,6 +260,33 @@ async function catchUpOneRoom($: Engine, fetch: ReturnType<typeof makeFetch>, c:
   }
   await ackEvents(fetch, room.id, batch.max_seq)
   await setLastSeen($, c.participantName, room.id, batch.max_seq)
+}
+
+/**
+ * Context-usage reminder (eot-initialization-automation, 2026-10-04). Logs each
+ * real reading of $.session.usage().context so the thresholds can be retuned
+ * against when compaction actually happens, then injects at most one line when
+ * a threshold is newly crossed. It only asks the member to decide; it never
+ * acts. A missing percent (before a window's first response) is skipped.
+ */
+async function contextReminder($: Engine, options: Record<string, unknown>) {
+  const c = await guardedCreds($, options)
+  const thresholds = parseThresholds(options.reminderThresholds)
+  if (thresholds.length === 0) return
+  const usage = await $.session.usage()
+  const { tokens, window, percent } = usage.context
+  if (percent == null) return
+  const logKey = storeKey('contextReadings', c.participantName)
+  const log = (await $.store.get(logKey)) as unknown[] | undefined
+  const entry = { at: await $.clock.now(), session: usage.startedAt, tokens, window, percent }
+  await $.store.set(logKey, [...(Array.isArray(log) ? log : []), entry].slice(-200))
+  const stateKey = storeKey('reminderState', c.participantName)
+  const stored = (await $.store.get(stateKey)) as ReminderState | undefined
+  const d = decideReminder(stored ?? EMPTY_REMINDER_STATE, usage.startedAt, percent, thresholds)
+  await $.store.set(stateKey, d.state)
+  if (d.text) {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: d.text }] } })
+  }
 }
 
 /** Level 1 (spec 3a): Teddy's per-identity ceiling. Default OFF; read at
@@ -463,6 +491,11 @@ export const register: Register = (on, options) => {
       await catchUp($, await guardedCreds($, options))
     } catch {
       // see session.start — silent here too, never block a user prompt over it
+    }
+    try {
+      await contextReminder($, options)
+    } catch {
+      // a reminder is a nicety: never block a prompt over it
     }
     return next(e)
   })
