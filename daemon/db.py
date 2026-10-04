@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -801,6 +802,11 @@ def _quota_check(conn, participant: str, incoming: int):
         raise HaikuError("the attachment store is full; ask a human")
 
 
+_STORE_NAME_RE = re.compile(
+    r"[0-9a-f]{32}\.(?:png|jpg|gif|webp|pdf|txt|md|json|csv)(?:\.part)?"
+)
+
+
 def sweep_attachments(conn, store_dir, now: datetime | None = None) -> dict:
     """Deletes unsent uploads older than ATTACH_UNBOUND_TTL_HOURS (row and
     file), stray .part files older than an hour, and any file in the store
@@ -822,6 +828,11 @@ def sweep_attachments(conn, store_dir, now: datetime | None = None) -> dict:
         cutoff = (now or datetime.now()).timestamp() - 3600
         for f in store.iterdir():
             if not f.is_file() or f.name in known:
+                continue
+            # Only files shaped like ours (Tessera's review): 32 hex + a
+            # known extension, optionally .part. Anything else someone put
+            # in this folder is not the sweep's to delete.
+            if not _STORE_NAME_RE.fullmatch(f.name):
                 continue
             if f.name.endswith(".part") and f.stat().st_mtime > cutoff:
                 continue  # an upload may be mid-write

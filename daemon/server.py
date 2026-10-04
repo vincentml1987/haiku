@@ -554,7 +554,10 @@ class SweepingHTTPServer(HTTPServer):
     serving thread, so the hourly attachment sweep shares the daemon's
     single sqlite connection safely (no second thread)."""
 
-    last_sweep = 0.0
+    # -inf, not 0.0: time.monotonic() counts from boot, so within the first
+    # hour after a reboot "now - 0 >= interval" was false and the startup
+    # sweep waited an hour (Tessera's review).
+    last_sweep = float("-inf")
 
     def service_actions(self):
         now = time.monotonic()
