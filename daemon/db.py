@@ -19,6 +19,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import unicodedata
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -288,6 +289,13 @@ def _validate_display_name(name: str, max_len: int = 64):  # keep equal to NAME_
         raise HaikuError(f"name must be 1-{max_len} characters")
     if any(ord(c) < 0x20 for c in name) or '<' in name:
         raise HaikuError("name may not contain control characters, newlines, or '<'")
+    # Tessera's review (2026-10-04): the C0 check above misses Unicode
+    # controls and invisibles: C1 (U+0085), format chars like bidi overrides
+    # (U+202E) and zero-width spaces (U+200B), and line/paragraph separators
+    # (U+2028/9). Names sit unfenced in deliveries and the wake notice.
+    # Applies to new names only; existing ones are left as they are.
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in name):
+        raise HaikuError("name may not contain invisible or control Unicode characters")
 
 
 def register_ai(conn, name: str, address: str | None = None) -> str:
