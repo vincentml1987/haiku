@@ -544,6 +544,81 @@ def main():
         except db.HaikuError:
             check("unknown target rejected", True)
 
+        # --- 2026-10-04: attachments: paused rooms, quotas, sweep ---
+        import shutil
+        import tempfile
+        store = tempfile.mkdtemp(prefix="haiku-test-db-attach-")
+        try:
+            png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+            aroom = db.create_room(conn, "attach-db", "Teddy", teddy_tok, mode="open")
+            db.join_room(conn, aroom, "Qualia", qualia_tok)
+            db.pause_room(conn, aroom, "Teddy", teddy_tok)
+            try:
+                db.upload_attachment(conn, store, aroom, "Qualia", qualia_tok, "a.png", png)
+                check("an AI cannot upload into a paused room", False)
+            except db.HaikuError:
+                check("an AI cannot upload into a paused room", True)
+            check("a human still can (paused waits on humans, not for them)",
+                  db.upload_attachment(conn, store, aroom, "Teddy", teddy_tok, "t.png", png)["mime"] == "image/png")
+            db.resume_room(conn, aroom, "Teddy", teddy_tok)
+
+            saved = db.ATTACH_MAX_UNBOUND
+            db.ATTACH_MAX_UNBOUND = 3
+            try:
+                for i in range(3):
+                    db.upload_attachment(conn, store, aroom, "Qualia", qualia_tok, f"u{i}.png", png)
+                try:
+                    db.upload_attachment(conn, store, aroom, "Qualia", qualia_tok, "u3.png", png)
+                    check("unsent uploads are capped per participant", False)
+                except db.HaikuError:
+                    check("unsent uploads are capped per participant", True)
+            finally:
+                db.ATTACH_MAX_UNBOUND = saved
+
+            saved = db.ATTACH_QUOTA["hour"]["count"]
+            db.ATTACH_QUOTA["hour"]["count"] = 4  # Qualia already has 3 this hour
+            try:
+                ok = db.upload_attachment(conn, store, aroom, "Qualia", qualia_tok, "u4.png", png)
+                try:
+                    db.upload_attachment(conn, store, aroom, "Qualia", qualia_tok, "u5.png", png)
+                    check("the hourly count quota refuses the next upload", False)
+                except db.HaikuError as e:
+                    check("the hourly count quota refuses the next upload", "quota" in str(e))
+                check("the quota is per participant (a human is unaffected)",
+                      db.upload_attachment(conn, store, aroom, "Teddy", teddy_tok, "t2.png", png) is not None)
+            finally:
+                db.ATTACH_QUOTA["hour"]["count"] = saved
+            saved = db.ATTACH_STORE_MAX_BYTES
+            stored = conn.execute("SELECT COALESCE(SUM(size), 0) FROM attachments").fetchone()[0]
+            db.ATTACH_STORE_MAX_BYTES = stored + len(png)  # room for exactly one more small file
+            try:
+                db.upload_precheck(conn, aroom, "Teddy", teddy_tok, len(png))  # fits exactly: allowed
+                db.upload_precheck(conn, aroom, "Teddy", teddy_tok, len(png) + 1)  # one byte over
+                check("the whole-store cap refuses an upload that would overflow it", False)
+            except db.HaikuError as e:
+                check("the whole-store cap refuses an upload that would overflow it", "full" in str(e))
+            finally:
+                db.ATTACH_STORE_MAX_BYTES = saved
+
+            # Sweep: age one unsent upload past the TTL; keep a sent one; drop a stray file.
+            sent = db.upload_attachment(conn, store, aroom, "Teddy", teddy_tok, "keep.png", png)
+            db.send_message(conn, aroom, "Teddy", teddy_tok, "keep this", attachment_ids=[sent["id"]])
+            conn.execute("UPDATE attachments SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?", (ok["id"],))
+            conn.execute("UPDATE attachments SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?", (sent["id"],))
+            stray = os.path.join(store, "0" * 32 + ".png")
+            open(stray, "wb").write(png)
+            before = set(os.listdir(store))
+            r = db.sweep_attachments(conn, store)
+            after = set(os.listdir(store))
+            check("the sweep removes an expired unsent upload (row and file)",
+                  f"{ok['id']}.png" in before and f"{ok['id']}.png" not in after
+                  and conn.execute("SELECT 1 FROM attachments WHERE id = ?", (ok["id"],)).fetchone() is None)
+            check("the sweep never touches a sent attachment, however old", f"{sent['id']}.png" in after)
+            check("the sweep removes a file with no row", not os.path.exists(stray) and r["orphans"] == 1)
+            check("a fresh unsent upload survives the sweep", len([f for f in after if f.endswith(".png")]) >= 3)
+        finally:
+            shutil.rmtree(store, ignore_errors=True)
+
         print("\nALL CHECKS PASSED")
     finally:
         cleanup(conn)

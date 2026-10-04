@@ -6,6 +6,9 @@ daemon/*.db-shm
 daemon/*.admin_secret
 daemon/*.backup-before-migration-*
 daemon/*.backup-before-restart-*
+# Attachment stores: participants' files, never source
+daemon/attachments/
+daemon/*.attachments/
 
 # Python
 __pycache__/

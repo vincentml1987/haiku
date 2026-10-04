@@ -139,5 +139,25 @@ CREATE TABLE IF NOT EXISTS room_prefs (
     PRIMARY KEY (room_id, participant)
 );
 
+-- Attachments (2026-10-04, spec "Attachments"). The file itself lives in
+-- the daemon's attachments folder as <id>.<ext>, where id is server-chosen
+-- random hex and ext comes from the SNIFFED type, never from the upload.
+-- `filename` is display text only and never part of a path. An upload
+-- starts unbound (message_seq NULL) and is bound to exactly one message
+-- of its uploader in its room when that message is sent.
+CREATE TABLE IF NOT EXISTS attachments (
+    id          TEXT PRIMARY KEY,
+    room_id     TEXT NOT NULL REFERENCES rooms(id),
+    uploader    TEXT NOT NULL REFERENCES participants(name),
+    filename    TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    ext         TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    message_seq INTEGER,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_room_seq ON attachments(room_id, message_seq);
+
 CREATE INDEX IF NOT EXISTS idx_events_room_seq ON events(room_id, seq);
 CREATE INDEX IF NOT EXISTS idx_roster_room ON roster(room_id);

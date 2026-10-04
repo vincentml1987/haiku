@@ -41,7 +41,7 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # with no user_version set (every db from before this system existed)
 # is treated as v1. A db whose user_version is HIGHER than this code
 # knows is refused outright rather than run against blindly.
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def _migrate_v1_to_v2(conn):
@@ -96,7 +96,27 @@ def _migrate_v3_to_v4(conn):
     """)
 
 
-MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4}
+def _migrate_v4_to_v5(conn):
+    """Adds attachments. Like v4, schema.sql already creates it on connect;
+    this keeps the version honest and is idempotent."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attachments (
+            id          TEXT PRIMARY KEY,
+            room_id     TEXT NOT NULL REFERENCES rooms(id),
+            uploader    TEXT NOT NULL REFERENCES participants(name),
+            filename    TEXT NOT NULL,
+            mime        TEXT NOT NULL,
+            ext         TEXT NOT NULL,
+            size        INTEGER NOT NULL,
+            sha256      TEXT NOT NULL,
+            message_seq INTEGER,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_room_seq ON attachments(room_id, message_seq)")
+
+
+MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5}
 
 
 def _migrate(conn, db_path, existed_before: bool):
@@ -589,9 +609,14 @@ def _set_obligation(conn, room_id: str, participant: str, seq: int | None):
 
 
 def send_message(conn, room_id: str, author: str, token: str, body: str,
-                  addressed_to: list[str] | None = None) -> dict:
+                  addressed_to: list[str] | None = None,
+                  attachment_ids: list[str] | None = None) -> dict:
     """addressed_to: None (unaddressed), ['all'], or a list of participant
-    names. Implements spec §3 turn-taking and §3.3 hop cap."""
+    names. Implements spec §3 turn-taking and §3.3 hop cap.
+    attachment_ids: this author's own unbound uploads in this room
+    (upload_attachment), bound to this message atomically."""
+    if attachment_ids is not None and not isinstance(attachment_ids, list):
+        raise HaikuError("attachment_ids must be a list")
     author_kind = authenticate(conn, author, token)
     room = _get_room(conn, room_id)
     if room["state"] == "archived":
@@ -605,6 +630,8 @@ def send_message(conn, room_id: str, author: str, token: str, body: str,
     with _transaction(conn):
         seq = _insert_event(conn, room_id, author, author_kind, "message",
                              addressed_to=addressed_to, body=body)
+        if attachment_ids:
+            _bind_attachments(conn, room_id, author, attachment_ids, seq)
 
         if author_kind == "human":
             # Newest human message wins (spec §3.1/§4 simplification): clear
@@ -735,9 +762,246 @@ def archive_room(conn, room_id: str, archived_by: str, token: str) -> str:
     return new_name
 
 
+# ---------- attachments (2026-10-04, spec "Attachments") ----------------
+#
+# Teddy's call (2026-10-04, haiku-update seq 30): AIs may attach as well as
+# humans, under one rule set.
+ATTACH_AI_ALLOWED = True
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+ATTACH_FILENAME_MAX = 128
+
+# Quotas (Tessera's review): an AI loop must not be able to fill the disk.
+# Per participant, counted from the attachments table, for everyone alike.
+ATTACH_QUOTA = {
+    "hour": {"count": 60, "bytes": 200 * 1024 * 1024},
+    "day": {"count": 300, "bytes": 1024 * 1024 * 1024},
+}
+ATTACH_MAX_UNBOUND = 20  # uploads not yet sent with a message, per participant
+ATTACH_STORE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # whole store, everyone
+ATTACH_UNBOUND_TTL_HOURS = 24  # the sweep deletes unsent uploads older than this
+
+
+def _quota_check(conn, participant: str, incoming: int):
+    for window, lim in ATTACH_QUOTA.items():
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS b FROM attachments
+                WHERE uploader = ? AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 {window}')""",
+            (participant,),
+        ).fetchone()
+        if row["n"] + 1 > lim["count"] or row["b"] + incoming > lim["bytes"]:
+            raise HaikuError(f"attachment quota reached for the last {window} "
+                             f"({lim['count']} files / {lim['bytes'] // (1024 * 1024)} MB)")
+    unbound = conn.execute(
+        "SELECT COUNT(*) AS n FROM attachments WHERE uploader = ? AND message_seq IS NULL", (participant,)
+    ).fetchone()["n"]
+    if unbound >= ATTACH_MAX_UNBOUND:
+        raise HaikuError(f"{unbound} uploads not yet sent; send or wait for them to expire before uploading more")
+    total = conn.execute("SELECT COALESCE(SUM(size), 0) AS b FROM attachments").fetchone()["b"]
+    if total + incoming > ATTACH_STORE_MAX_BYTES:
+        raise HaikuError("the attachment store is full; ask a human")
+
+
+def sweep_attachments(conn, store_dir, now: datetime | None = None) -> dict:
+    """Deletes unsent uploads older than ATTACH_UNBOUND_TTL_HOURS (row and
+    file), stray .part files older than an hour, and any file in the store
+    with no row. Run at daemon start and hourly. Never touches a sent file."""
+    store = Path(store_dir)
+    removed = {"expired": 0, "orphans": 0}
+    with _transaction(conn):
+        rows = conn.execute(
+            f"""SELECT id, ext FROM attachments WHERE message_seq IS NULL
+                AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{int(ATTACH_UNBOUND_TTL_HOURS)} hours')"""
+        ).fetchall()
+        for r in rows:
+            conn.execute("DELETE FROM attachments WHERE id = ?", (r["id"],))
+    for r in rows:
+        (store / f"{r['id']}.{r['ext']}").unlink(missing_ok=True)
+        removed["expired"] += 1
+    if store.is_dir():
+        known = {f"{r['id']}.{r['ext']}" for r in conn.execute("SELECT id, ext FROM attachments")}
+        cutoff = (now or datetime.now()).timestamp() - 3600
+        for f in store.iterdir():
+            if not f.is_file() or f.name in known:
+                continue
+            if f.name.endswith(".part") and f.stat().st_mtime > cutoff:
+                continue  # an upload may be mid-write
+            f.unlink(missing_ok=True)
+            removed["orphans"] += 1
+    return removed
+
+# ext -> (mime, kind). The extension only says which family the uploader
+# CLAIMS; the bytes must prove it (_sniff). Never html, svg, scripts, or
+# anything a browser or OS would execute or render actively.
+_ATTACH_TYPES = {
+    "png": ("image/png", "image"),
+    "jpg": ("image/jpeg", "image"),
+    "jpeg": ("image/jpeg", "image"),
+    "gif": ("image/gif", "image"),
+    "webp": ("image/webp", "image"),
+    "pdf": ("application/pdf", "pdf"),
+    "txt": ("text/plain; charset=utf-8", "text"),
+    "md": ("text/markdown; charset=utf-8", "text"),
+    "json": ("application/json", "text"),
+    "csv": ("text/csv; charset=utf-8", "text"),
+}
+
+
+def _sniff(data: bytes, ext: str) -> str | None:
+    """True content check for the claimed extension: image magic bytes must
+    match that exact image type; pdf must start %PDF-; text types must be
+    valid UTF-8 with no NUL and (json) must parse. Returns the stored
+    extension (jpeg normalized to jpg), or None to reject."""
+    if ext not in _ATTACH_TYPES:
+        return None
+    if ext == "png":
+        return "png" if data.startswith(b"\x89PNG\r\n\x1a\n") else None
+    if ext in ("jpg", "jpeg"):
+        return "jpg" if data.startswith(b"\xff\xd8\xff") else None
+    if ext == "gif":
+        return "gif" if data[:6] in (b"GIF87a", b"GIF89a") else None
+    if ext == "webp":
+        return "webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else None
+    if ext == "pdf":
+        return "pdf" if data.startswith(b"%PDF-") else None
+    # text family
+    if b"\x00" in data:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if ext == "json":
+        try:
+            json.loads(text)
+        except ValueError:
+            return None
+    return ext
+
+
+def _display_filename(raw: str) -> str:
+    """Display text only. Path components are dropped, and the same rules
+    as any other unfenced name apply (no controls, invisibles or '<')."""
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    _validate_display_name(base, max_len=ATTACH_FILENAME_MAX)
+    return base
+
+
+def attachment_path(store_dir, att: dict) -> Path:
+    return Path(store_dir) / f"{att['id']}.{att['ext']}"
+
+
+def _attachment_public(att, store_dir) -> dict:
+    d = {"id": att["id"], "filename": att["filename"], "mime": att["mime"], "size": att["size"]}
+    if store_dir is not None:
+        # A local absolute path, for AI sessions on this machine to open with
+        # their own Read tool. Daemon-chosen (id + sniffed ext), never upload text.
+        d["local_path"] = str(attachment_path(store_dir, att).resolve())
+    return d
+
+
+def upload_precheck(conn, room_id: str, participant: str, token: str, size: int) -> str:
+    """Every upload rule that doesn't need the bytes. The HTTP layer calls
+    this BEFORE reading the body, so a refused upload costs no read time;
+    upload_attachment calls it again (the state could change in between)."""
+    kind = authenticate(conn, participant, token)
+    if kind == "ai" and not ATTACH_AI_ALLOWED:
+        raise Forbidden("only humans may attach files")
+    room = _get_room(conn, room_id)
+    if room["state"] == "archived":
+        raise HaikuError("room is archived")
+    _require_member(conn, room_id, participant)
+    # Mirror send_message (Tessera's review): an AI can't send in a paused
+    # room, so it can't stage uploads there either.
+    if room["state"] == "paused" and kind == "ai":
+        raise HaikuError("room paused, waiting on Teddy")
+    if size <= 0:
+        raise HaikuError("empty file")
+    if size > MAX_ATTACHMENT_BYTES:
+        raise HaikuError(f"file exceeds {MAX_ATTACHMENT_BYTES} bytes")
+    _quota_check(conn, participant, size)
+    return kind
+
+
+def upload_attachment(conn, store_dir, room_id: str, participant: str, token: str,
+                      filename: str, data: bytes) -> dict:
+    """Stores one file, unbound, for the uploader to attach to its next
+    message in this room (send_message's attachment_ids)."""
+    upload_precheck(conn, room_id, participant, token, len(data))
+    name = _display_filename(filename)
+    claimed = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    ext = _sniff(data, claimed)
+    if ext is None:
+        allowed = ", ".join(sorted(set(_ATTACH_TYPES)))
+        raise HaikuError(f"file type not allowed or content does not match its extension (allowed: {allowed})")
+    att_id = secrets.token_hex(16)
+    mime = _ATTACH_TYPES[ext][0]
+    store = Path(store_dir)
+    store.mkdir(parents=True, exist_ok=True)
+    final = store / f"{att_id}.{ext}"
+    tmp = store / f"{att_id}.{ext}.part"
+    tmp.write_bytes(data)
+    os.replace(tmp, final)
+    try:
+        with _transaction(conn):
+            conn.execute(
+                """INSERT INTO attachments (id, room_id, uploader, filename, mime, ext, size, sha256)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (att_id, room_id, participant, name, mime, ext, len(data), hashlib.sha256(data).hexdigest()),
+            )
+    except Exception:
+        final.unlink(missing_ok=True)
+        raise
+    row = conn.execute("SELECT * FROM attachments WHERE id = ?", (att_id,)).fetchone()
+    return _attachment_public(row, store_dir)
+
+
+def _bind_attachments(conn, room_id: str, author: str, attachment_ids: list[str], seq: int):
+    """Inside send_message's transaction. Each id must be this author's own
+    unbound upload in this room; anything else fails the whole send."""
+    if len(set(attachment_ids)) != len(attachment_ids):
+        raise HaikuError("duplicate attachment id")
+    for att_id in attachment_ids:
+        row = conn.execute("SELECT room_id, uploader, message_seq FROM attachments WHERE id = ?",
+                           (str(att_id),)).fetchone()
+        if row is None or row["room_id"] != room_id or row["uploader"] != author:
+            raise HaikuError(f"no such attachment of yours in this room: {att_id}")
+        if row["message_seq"] is not None:
+            raise HaikuError(f"attachment already sent: {att_id}")
+        conn.execute("UPDATE attachments SET message_seq = ? WHERE id = ?", (seq, str(att_id)))
+
+
+def _attachments_for(conn, room_id: str, seqs: list[int], store_dir) -> dict[int, list[dict]]:
+    if not seqs:
+        return {}
+    rows = conn.execute(
+        "SELECT * FROM attachments WHERE room_id = ? AND message_seq BETWEEN ? AND ? ORDER BY created_at",
+        (room_id, min(seqs), max(seqs)),
+    ).fetchall()
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["message_seq"], []).append(_attachment_public(r, store_dir))
+    return out
+
+
+def get_attachment(conn, store_dir, room_id: str, att_id: str, participant: str, token: str) -> tuple[dict, Path]:
+    """Serving: current members only, checked every time. Unbound uploads
+    are visible to their uploader only."""
+    authenticate(conn, participant, token)
+    _get_room(conn, room_id)
+    _require_member(conn, room_id, participant)
+    row = conn.execute("SELECT * FROM attachments WHERE id = ? AND room_id = ?", (att_id, room_id)).fetchone()
+    if row is None or (row["message_seq"] is None and row["uploader"] != participant):
+        raise HaikuError("no such attachment")
+    path = attachment_path(store_dir, row)
+    if not path.is_file():
+        raise HaikuError("attachment file is missing")
+    return dict(row), path
+
+
 def read_events(conn, room_id: str, participant: str, token: str,
                  since: int | None = None, limit: int | None = None,
-                 advance: bool = True, exclude_self: bool = False) -> dict:
+                 advance: bool = True, exclude_self: bool = False,
+                 store_dir=None) -> dict:
     """Returns {"events": [...], "max_seq": N}. `events` is after `since`
     (explicit pull) or the stored cursor (default catch-up), filtered by
     `exclude_self` if set. `max_seq` is the highest seq SCANNED in this
@@ -769,8 +1033,10 @@ def read_events(conn, room_id: str, participant: str, token: str,
     candidates = conn.execute(query, params).fetchall()
     max_seq = candidates[-1]["seq"] if candidates else since
     visible = [r for r in candidates if not (exclude_self and r["author"] == participant)]
+    atts = _attachments_for(conn, room_id, [r["seq"] for r in visible if r["type"] == "message"], store_dir)
     events = [
-        {**dict(r), "addressed_to": json.loads(r["addressed_to"]) if r["addressed_to"] else None}
+        {**dict(r), "addressed_to": json.loads(r["addressed_to"]) if r["addressed_to"] else None,
+         **({"attachments": atts[r["seq"]]} if r["seq"] in atts else {})}
         for r in visible
     ]
 

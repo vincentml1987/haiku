@@ -34,9 +34,10 @@ import json
 import re
 import socket
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import db
 
@@ -48,6 +49,20 @@ SOCKET_TIMEOUT_S = 10
 
 ROOM_ID = r"(?P<room_id>[^/]+)"
 ROUTES = []  # (method, compiled_path_re, handler_name)
+
+# Attachments (2026-10-04) are binary in both directions, so they bypass
+# the JSON body reader and JSON responder; see Handler._attachment_*.
+ATTACH_READ_DEADLINE_S = 60
+SWEEP_INTERVAL_S = 3600
+ATTACH_UPLOAD_RE = re.compile(r"^/rooms/(?P<room_id>[^/]+)/attachments$")
+ATTACH_GET_RE = re.compile(r"^/rooms/(?P<room_id>[^/]+)/attachments/(?P<att_id>[0-9a-f]{32})$")
+
+
+def default_store_dir(db_path: str) -> Path:
+    """Attachments live next to the db, in a folder named after it, outside
+    any path a client controls. Gitignored (daemon/attachments*)."""
+    p = Path(db_path)
+    return p.parent / ("attachments" if p.name == "haiku.db" else f"{p.stem}.attachments")
 
 
 class ClientError(Exception):
@@ -173,7 +188,8 @@ def h_leave(conn, params, body, headers, room_id):
 @route("POST", f"/rooms/{ROOM_ID}/send")
 def h_send(conn, params, body, headers, room_id):
     author, token = _auth_headers(headers)
-    return db.send_message(conn, room_id, author, token, body["body"], addressed_to=body.get("addressed_to"))
+    return db.send_message(conn, room_id, author, token, body["body"], addressed_to=body.get("addressed_to"),
+                           attachment_ids=body.get("attachment_ids"))
 
 
 @route("POST", f"/rooms/{ROOM_ID}/pass")
@@ -208,6 +224,7 @@ def h_events(conn, params, body, headers, room_id):
         since=_int("since"), limit=_int("limit"),
         advance=_bool(params.get("advance", [None])[0], default=True),
         exclude_self=_bool(params.get("exclude_self", [None])[0], default=False),
+        store_dir=Handler.store_dir,
     )
 
 
@@ -308,6 +325,7 @@ CSP = (
 class Handler(BaseHTTPRequestHandler):
     conn = None  # set by main() before serving
     port = DEFAULT_PORT
+    store_dir = default_store_dir(DEFAULT_DB_PATH)  # main() sets it from the db path
     timeout = SOCKET_TIMEOUT_S  # socketserver applies this as the request socket timeout
 
     def _respond(self, status, payload):
@@ -381,6 +399,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and self._respond_static(parsed.path):
             return
 
+        m = ATTACH_UPLOAD_RE.match(parsed.path) if method == "POST" else None
+        if m:
+            return self._guarded(self._attachment_upload, m.group("room_id"))
+        m = ATTACH_GET_RE.match(parsed.path) if method == "GET" else None
+        if m:
+            return self._guarded(self._attachment_get, m.group("room_id"), m.group("att_id"))
+
         try:
             body = self._read_json_body()
         except ClientError as e:
@@ -408,6 +433,82 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond(404, {"error": "no such route"})
 
+    def _guarded(self, fn, *args):
+        """Same error mapping as the JSON routes, for the binary ones."""
+        try:
+            return fn(*args)
+        except ClientError as e:
+            return self._respond(e.status, {"error": e.message})
+        except db.Forbidden as e:
+            return self._respond(403, {"error": str(e)})
+        except db.HaikuError as e:
+            return self._respond(400, {"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            print(f"[haiku daemon] internal error on attachment {self.path}: {e!r}", file=sys.stderr)
+            return self._respond(500, {"error": "internal error"})
+
+    def _attachment_upload(self, room_id):
+        """POST raw bytes. Content-Type must be application/octet-stream
+        (never a form type, so a cross-site form can't post here), the
+        display filename travels URL-encoded in X-Haiku-Filename, and the
+        usual identity headers are required."""
+        participant, token = _auth_headers(self.headers)
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/octet-stream":
+            raise ClientError(400, "upload requires Content-Type: application/octet-stream")
+        filename = unquote(self.headers.get("X-Haiku-Filename") or "")
+        if not filename:
+            raise ClientError(400, "missing X-Haiku-Filename header")
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            raise ClientError(411, "Content-Length required")
+        if length > db.MAX_ATTACHMENT_BYTES:
+            raise ClientError(413, f"file exceeds {db.MAX_ATTACHMENT_BYTES} bytes")
+        # Everything that doesn't need the bytes is checked BEFORE reading
+        # them (auth, membership, paused room, quota), so a refused upload
+        # never ties up the single-threaded daemon for a 20 MB read.
+        db.upload_precheck(self.conn, room_id, participant, token, length)
+        # An overall deadline, not just the per-recv socket timeout (Tessera's
+        # review: one byte every 9 s would otherwise hold the daemon for ages).
+        deadline = time.monotonic() + ATTACH_READ_DEADLINE_S
+        chunks, got = [], 0
+        try:
+            while got < length:
+                if time.monotonic() > deadline:
+                    raise ClientError(408, f"upload took longer than {ATTACH_READ_DEADLINE_S} s")
+                chunk = self.rfile.read1(min(65536, length - got))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+        except (socket.timeout, TimeoutError):
+            raise ClientError(408, "upload timed out")
+        data = b"".join(chunks)
+        if len(data) != length:
+            raise ClientError(400, "upload was cut short")
+        att = db.upload_attachment(self.conn, self.store_dir, room_id, participant, token, filename, data)
+        return self._respond(200, att)
+
+    def _attachment_get(self, room_id, att_id):
+        participant, token = _auth_headers(self.headers)
+        att, path = db.get_attachment(self.conn, self.store_dir, room_id, att_id, participant, token)
+        data = path.read_bytes()
+        is_image = att["mime"].startswith("image/")
+        disp = "inline" if is_image else "attachment"
+        self.send_response(200)
+        self.send_header("Content-Type", att["mime"])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f"{disp}; filename*=UTF-8''{quote(att['filename'], safe='')}")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # Even an image response can't run anything on the UI's origin.
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         self._dispatch("GET")
 
@@ -421,6 +522,25 @@ class Handler(BaseHTTPRequestHandler):
         pass  # quiet by default; rooms already have their own event log
 
 
+class SweepingHTTPServer(HTTPServer):
+    """serve_forever calls service_actions() between requests, on the one
+    serving thread, so the hourly attachment sweep shares the daemon's
+    single sqlite connection safely (no second thread)."""
+
+    last_sweep = 0.0
+
+    def service_actions(self):
+        now = time.monotonic()
+        if now - self.last_sweep >= SWEEP_INTERVAL_S:
+            self.last_sweep = now
+            try:
+                r = db.sweep_attachments(Handler.conn, Handler.store_dir)
+                if r["expired"] or r["orphans"]:
+                    print(f"[haiku daemon] attachment sweep: {r}", flush=True)
+            except Exception as e:  # noqa: BLE001 — a failed sweep must never stop serving
+                print(f"[haiku daemon] attachment sweep failed: {e!r}", file=sys.stderr, flush=True)
+
+
 def main():
     db_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DB_PATH
     port = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_PORT
@@ -428,8 +548,9 @@ def main():
     conn = db.connect(db_path)
     Handler.conn = conn
     Handler.port = port
+    Handler.store_dir = default_store_dir(db_path)
 
-    server = HTTPServer((HOST, port), Handler)
+    server = SweepingHTTPServer((HOST, port), Handler)  # first sweep runs at startup
     print(f"HAIKU daemon listening on http://{HOST}:{port} (db: {db_path})")
     print(f"Admin secret: {db._admin_secret_path(db_path)}")
     try:

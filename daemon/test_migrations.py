@@ -158,6 +158,10 @@ def main():
         check("schema version after connect() is current",
               conn.execute("PRAGMA user_version").fetchone()[0] == db.CURRENT_SCHEMA_VERSION)
 
+        for table in ("room_prefs", "attachments"):  # v4 and v5
+            check(f"migration creates the {table} table",
+                  conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None)
+
         row_count = conn.execute("SELECT COUNT(*) FROM events WHERE room_id = 'r1'").fetchone()[0]
         check("the pre-existing event row survived the migration", row_count == 1)
         surviving = conn.execute(

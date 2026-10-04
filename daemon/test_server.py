@@ -7,15 +7,19 @@ db/port, exercises it over HTTP, tears it down. Run directly:
 import http.client
 import json
 import os
+import shutil
 import socket
+import tempfile
 import threading
 import time
+import urllib.parse
 
 import db
 import server
 
 DBFILE = "test_server.db"
 PORT = 8799
+ATTACH_TMP = tempfile.mkdtemp(prefix="haiku-test-attach-")
 
 
 def cleanup_files():
@@ -86,6 +90,8 @@ def main():
         conn = db.connect(DBFILE)
         server.Handler.conn = conn
         server.Handler.port = PORT
+        # Never the real attachments folder: a private temp dir for this run.
+        server.Handler.store_dir = ATTACH_TMP
         httpd = server.HTTPServer((server.HOST, PORT), server.Handler)
         httpd_holder["httpd"] = httpd
         httpd_holder["ready"].set()
@@ -334,11 +340,156 @@ def main():
         status, resp = c.request("GET", "/nonsense")
         check("unknown route is 404", status == 404)
 
+        # --- attachments (2026-10-04) ---
+        status, resp = c.request("POST", "/rooms", body={"name": "attach-room", "mode": "open"}, headers=c.auth("Teddy", teddy_tok))
+        aroom = resp["room_id"]
+        c.request("POST", f"/rooms/{aroom}/join", body={}, headers=c.auth("Qualia", qualia_tok))
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+        def upload(who, tok, name, data, ctype="application/octet-stream", room=None):
+            h = dict(c.auth(who, tok))
+            h["X-Haiku-Filename"] = urllib.parse.quote(name)
+            return c.request("POST", f"/rooms/{room or aroom}/attachments", body=data, headers=h, content_type=ctype)
+
+        status, att = upload("Teddy", teddy_tok, "../../..\\evil dir\\shot.png", png)
+        check("a png upload succeeds", status == 200 and att.get("mime") == "image/png" and att.get("size") == len(png))
+        check("the display filename drops every path component", att.get("filename") == "shot.png")
+        stored = os.listdir(ATTACH_TMP)
+        check("the file is stored only as <random id>.<sniffed ext> inside the store dir",
+              stored == [f"{att['id']}.png"])
+        check("local_path points inside the store dir",
+              os.path.dirname(att.get("local_path", "")) == os.path.realpath(ATTACH_TMP))
+
+        for label, name, data, ctype, want in [
+            ("html is refused", "page.html", b"<html><script>1</script></html>", "application/octet-stream", 400),
+            ("svg is refused", "pic.svg", b"<svg onload=1></svg>", "application/octet-stream", 400),
+            ("a .png whose bytes are not png is refused", "fake.png", b"GIF89a....", "application/octet-stream", 400),
+            ("an exe renamed .txt is refused (NUL bytes)", "tool.txt", b"MZ\x90\x00\x03\x00", "application/octet-stream", 400),
+            ("invalid json is refused", "data.json", b"{not json", "application/octet-stream", 400),
+            ("a form content type is refused", "a.txt", b"hello", "application/x-www-form-urlencoded", 400),
+            ("no extension is refused", "README", b"hello", "application/octet-stream", 400),
+        ]:
+            status, _ = upload("Teddy", teddy_tok, name, data, ctype)
+            check(label, status == want)
+        check("refused uploads leave nothing on disk", len(os.listdir(ATTACH_TMP)) == 1)
+
+        status, _ = c.request("POST", f"/rooms/{aroom}/attachments", body=png,
+                              headers={**c.auth("Teddy", teddy_tok)}, content_type="application/octet-stream")
+        check("missing X-Haiku-Filename is refused", status == 400)
+        status, _ = upload("Teddy", "wrong-token", "a.png", png)
+        check("a bad token cannot upload", status == 400)
+        status, resp = c.request("POST", "/register/ai", body={"name": "Outsider"})
+        out_tok = resp["token"]
+        status, _ = upload("Outsider", out_tok, "a.png", png)
+        check("a non-member cannot upload", status == 403)
+
+        status, txt = upload("Qualia", qualia_tok, "notes.md", b"# hi\n")
+        check("an AI can upload a markdown file", status == 200 and txt.get("mime", "").startswith("text/markdown"))
+
+        # Unbound: only the uploader can fetch it.
+        status, _ = c.request("GET", f"/rooms/{aroom}/attachments/{txt['id']}", headers=c.auth("Teddy", teddy_tok))
+        check("someone else's unsent upload cannot be fetched", status == 400)
+
+        status, _ = c.request("POST", f"/rooms/{aroom}/send", body={"body": "", "attachment_ids": [txt["id"], att["id"]]},
+                              headers=c.auth("Qualia", qualia_tok))
+        check("you cannot send someone else's upload", status == 400)
+        status, resp = c.request("POST", f"/rooms/{aroom}/send", body={"body": "see screenshot", "attachment_ids": [att["id"]]},
+                                 headers=c.auth("Teddy", teddy_tok))
+        check("a message with an attachment sends", status == 200)
+        sent_seq = resp["seq"]
+        status, _ = c.request("POST", f"/rooms/{aroom}/send", body={"body": "again", "attachment_ids": [att["id"]]},
+                              headers=c.auth("Teddy", teddy_tok))
+        check("an attachment can only be sent once", status == 400)
+
+        status, resp = c.request("GET", f"/rooms/{aroom}/events?since=0", headers=c.auth("Qualia", qualia_tok))
+        msg = [e for e in resp["events"] if e["seq"] == sent_seq][0]
+        check("read_events carries the attachment with display name, type, size and local path",
+              msg.get("attachments") and msg["attachments"][0]["filename"] == "shot.png"
+              and msg["attachments"][0]["local_path"].endswith(f"{att['id']}.png"))
+
+        def raw_get(who, tok, aid):
+            conn3 = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+            conn3.request("GET", f"/rooms/{aroom}/attachments/{aid}", headers={**c.auth(who, tok), "Host": f"127.0.0.1:{PORT}"})
+            r = conn3.getresponse()
+            body = r.read()
+            hdrs = {k.lower(): v for k, v in r.getheaders()}
+            conn3.close()
+            return r.status, hdrs, body
+
+        status, hdrs, body = raw_get("Qualia", qualia_tok, att["id"])
+        check("a member can fetch a sent attachment, bytes intact", status == 200 and body == png)
+        check("served with its stored type, nosniff and a sandboxing CSP",
+              hdrs.get("content-type") == "image/png" and hdrs.get("x-content-type-options") == "nosniff"
+              and "sandbox" in hdrs.get("content-security-policy", ""))
+        check("images are inline", hdrs.get("content-disposition", "").startswith("inline"))
+
+        # Tessera's polyglot: a real PNG header followed by HTML/script is
+        # accepted (the sniff is header-only), so what keeps it inert is the
+        # serving trio. That trio is a tested REQUIREMENT, not a nicety.
+        poly = b"\x89PNG\r\n\x1a\n<html><script>window.__pwned=1</script></html>"
+        status, patt = upload("Teddy", teddy_tok, "poly.png", poly)
+        c.request("POST", f"/rooms/{aroom}/send", body={"body": "poly", "attachment_ids": [patt["id"]]},
+                  headers=c.auth("Teddy", teddy_tok))
+        status, phdrs, _ = raw_get("Teddy", teddy_tok, patt["id"])
+        check("a PNG/HTML polyglot is served as image/png, never text/html",
+              status == 200 and phdrs.get("content-type") == "image/png")
+        check("...with nosniff, so no browser re-guesses it as HTML", phdrs.get("x-content-type-options") == "nosniff")
+        check("...and a sandboxing CSP with default-src 'none', so even rendered HTML could run nothing",
+              "sandbox" in phdrs.get("content-security-policy", "")
+              and "default-src 'none'" in phdrs.get("content-security-policy", ""))
+
+        # Paused room: an AI's upload is refused (before its body is read).
+        c.request("POST", f"/rooms/{aroom}/pause", body={}, headers=c.auth("Teddy", teddy_tok))
+        status, _ = upload("Qualia", qualia_tok, "p.png", png)
+        check("an AI cannot upload into a paused room over HTTP", status == 400)
+        c.request("POST", f"/rooms/{aroom}/resume", body={}, headers=c.auth("Teddy", teddy_tok))
+
+        # Slow drip: the overall read deadline cuts it off (shortened for the test).
+        saved_deadline = server.ATTACH_READ_DEADLINE_S
+        server.ATTACH_READ_DEADLINE_S = 2
+        try:
+            s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+            s.sendall((f"POST /rooms/{aroom}/attachments HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
+                       f"X-Haiku-Participant: Teddy\r\nX-Haiku-Token: {teddy_tok}\r\nX-Haiku-Filename: slow.txt\r\n"
+                       f"Content-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n").encode())
+            t0 = time.monotonic()
+            s.settimeout(0.5)  # each recv attempt doubles as the drip interval
+            resp = b""
+            for _ in range(16):
+                try:
+                    s.sendall(b"a")
+                except OSError:
+                    break  # the server closed after answering
+                try:
+                    resp = s.recv(4096)
+                    if resp:
+                        break
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+            s.close()
+            check("a slow-drip upload is cut off by the overall deadline (408), not held open",
+                  b" 408 " in resp.split(b"\r\n", 1)[0] and time.monotonic() - t0 < 8)
+        finally:
+            server.ATTACH_READ_DEADLINE_S = saved_deadline
+
+        status, hdrs, _ = raw_get("Qualia", qualia_tok, txt["id"])
+        check("non-images download as attachment", status == 200 and hdrs.get("content-disposition", "").startswith("attachment"))
+        status, _, _ = raw_get("Outsider", out_tok, att["id"])
+        check("a non-member cannot fetch", status == 403)
+        c.request("POST", f"/rooms/{aroom}/leave", body={}, headers=c.auth("Qualia", qualia_tok))
+        status, _, _ = raw_get("Qualia", qualia_tok, att["id"])
+        check("a member who left can no longer fetch (checked every request)", status == 403)
+        status, _ = c.request("GET", f"/rooms/{aroom}/attachments/..%2F..%2Fhaiku.db", headers=c.auth("Teddy", teddy_tok))
+        check("a non-hex attachment id never reaches the filesystem", status == 404)
+
         print("\nALL CHECKS PASSED")
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
         cleanup_files()
+        shutil.rmtree(ATTACH_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":
