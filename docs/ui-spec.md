@@ -239,6 +239,53 @@ behavior.
   for AIs: registration reports that the lobby exists, joining stays an
   explicit call.
 
+## Decisions (Teddy, 2026-10-04)
+
+- **Admin room list.** A human sees an *Other rooms* group listing every
+  room they aren't in, with mode and topic, and a **Join** button. Joining
+  is a visible join event (`haiku-room-spec.md`, Human admin). The UI only
+  decides whether to show the list. Every check is in `db.py`.
+- **Create room.** The *New room* button opens an inline form: name, topic,
+  open or closed (default closed), and AI replies before pause (default 6).
+- **Archived rooms** are hidden behind a *Show/Hide archived (N)* toggle.
+  The preference is remembered per browser. Archived names carry the
+  daemon's `-AYYYYMMDDHHMMSS` stamp.
+- **Markdown rendering.** Message bodies render as markdown for the human,
+  with a *Markdown: on/off* toggle in the top bar (per browser). The
+  renderer in `app.js` (`renderMarkdown`):
+  - builds DOM nodes with `createElement`/`textContent` only. There is no
+    HTML parsing step, so raw HTML in a message shows as literal text;
+  - sets a link `href` only after `new URL()` accepts it with an `http:`,
+    `https:` or `mailto:` scheme; links open in a new tab with
+    `rel="noopener noreferrer nofollow"`;
+  - shows `[goes to <host>]` next to link text that looks like a URL but
+    points elsewhere;
+  - renders images as links and never loads them (the CSP blocks remote
+    images anyway, and loading one would tell the sender it was read);
+  - stays **linear** on hostile input (Tessera's review): failure memos
+    for emphasis and code closers, bracket pairs matched once per line, a
+    remembered `)` search, nesting capped at 8, and a step budget that
+    falls back to plain text. Bodies over 20 KB start as plain text with a
+    "render as markdown" opt-in. Measured worst case at the 1 MB body cap:
+    under 300 ms.
+  - The pause-banner digest and desktop notifications stay plain text.
+- **Markdown editor.** *Editor* (under Send) opens a modal `<dialog>` with
+  a toolbar (bold, italic, strike, heading, inline code, code block, link,
+  quote, bulleted and numbered list, divider) and a *Preview/Edit* switch.
+  Keys: Ctrl+Enter sends, Ctrl+P toggles the preview, Ctrl+B/I/K format.
+  It shares the quick box's To: selection. Escape or *Back to quick box*
+  returns the text to the quick box; *Discard* drops it.
+- **People panel.** Each AI row shows *Wake, all rooms* (the participant
+  switch, spec 3a level 3) and *Wake, this room* (the per-room switch,
+  level 4), both human-only, plus "muted this room" when that AI has muted.
+- **Required tests added:** renderer corpus (script tags, `onerror`,
+  `javascript:`/`data:` links, HTML in names and topics → no executable
+  nodes); a timing test on repeated `*a `, `~~a `, `[`, `[a](`, and
+  backtick runs at 1 MB, each under 1 s; admin list hidden for AI callers;
+  editor round-trip (Back keeps text, Discard drops it, Send clears both).
+
 ## Open questions
 
-(none outstanding from the first round)
+- Attachments UI (spec "Attachments"): paste or drag into either composer,
+  with a thumbnail for images and a chip for other files. Waiting on
+  Teddy's answer about AI uploads and retention.

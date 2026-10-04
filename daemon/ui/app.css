@@ -259,6 +259,8 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 .md hr { border: none; border-top: 1px solid var(--line); margin: 0.6em 0; }
 .md a { color: var(--accent); overflow-wrap: anywhere; }
 .md-imglink { font-style: italic; }
+.md-realhost { color: var(--muted); font-size: 0.85em; }
+.md-note:empty { display: none; }
 
 /* markdown editor dialog */
 #md-dialog {

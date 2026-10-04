@@ -120,6 +120,21 @@ function asList(v) {
  */
 
 const MD_MAX_DEPTH = 8;
+// Availability limits (Tessera's review, 2026-10-04): a naive closer search
+// is quadratic, and a 1 MB body could freeze the tab on every reload.
+// Bodies over MD_AUTO_CHARS are shown as text with an opt-in button; any
+// render that spends more than MD_STEP_BUDGET scanned characters gives up
+// and falls back to plain text; link scans stop after MD_LINK_SCAN chars.
+const MD_AUTO_CHARS = 20000;
+const MD_STEP_BUDGET = 5000000;
+const MD_LINK_SCAN = 2000;
+
+class MdBudgetExceeded extends Error {}
+let mdSteps = 0;
+function mdSpend(n) {
+  mdSteps += n;
+  if (mdSteps > MD_STEP_BUDGET) throw new MdBudgetExceeded();
+}
 
 function safeUrl(raw) {
   const s = String(raw || '').trim();
@@ -140,6 +155,21 @@ function linkNode(href, children, isImage) {
   if (isImage) a.appendChild(document.createTextNode('[image] '));
   for (const c of children) a.appendChild(c);
   if (!a.childNodes.length) a.textContent = href;
+  // Link text that itself looks like a URL but points somewhere else gets
+  // the real host shown next to it, so [https://a.example](https://b.example)
+  // can't pass for a link to a.example.
+  const shown = a.textContent.trim();
+  if (/^(https?:\/\/|www\.)/i.test(shown)) {
+    let shownHost = null;
+    try { shownHost = new URL(/^www\./i.test(shown) ? 'https://' + shown : shown).host; } catch (e) { /* not a URL */ }
+    const realHost = new URL(href).host;
+    if (shownHost !== realHost) {
+      const span = document.createElement('span');
+      span.appendChild(a);
+      span.appendChild(el('span', { cls: 'md-realhost', text: ' [goes to ' + (realHost || href) + ']' }));
+      return span;
+    }
+  }
   return a;
 }
 
@@ -149,20 +179,38 @@ const RE_ESCAPABLE = /[\\`*_{}\[\]()#+\-.!~>|<]/;
 
 function isWordChar(ch) { return !!ch && /[\p{L}\p{N}]/u.test(ch); }
 
-// Finds "[text](url)" starting at s[i] === '['. Returns {text, url, end} or null.
-function matchLink(s, i) {
-  let depth = 0;
-  let j = i;
-  for (; j < s.length; j++) {
-    const ch = s[j];
-    if (ch === '\\') { j++; continue; }
-    if (ch === '[') depth++;
-    else if (ch === ']') { depth--; if (depth === 0) break; }
-    else if (ch === '\n' && s[j + 1] === '\n') return null;
+// Pairs every '[' with its matching ']' in one linear pass (backslash
+// escapes skipped), so link matching never rescans the line.
+function bracketPairs(s) {
+  const closeOf = new Map();
+  const stack = [];
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (ch === '\\') { k++; continue; }
+    if (ch === '[') stack.push(k);
+    else if (ch === ']' && stack.length) closeOf.set(stack.pop(), k);
   }
-  if (j >= s.length || s[j + 1] !== '(') return null;
-  const close = s.indexOf(')', j + 2);
-  if (close < 0) return null;
+  mdSpend(s.length);
+  return closeOf;
+}
+
+// Finds "[text](url)" starting at s[i] === '['. Returns {text, url, end} or
+// null. `ctx` carries the line's bracket pairs and whether a ')' search has
+// already run off the end of the line (then none will ever succeed).
+function matchLink(s, i, ctx) {
+  if (!ctx.closeOf) ctx.closeOf = bracketPairs(s);
+  const j = ctx.closeOf.get(i);
+  if (j === undefined || j - i > MD_LINK_SCAN || s[j + 1] !== '(' || ctx.noParen) return null;
+  // The first ')' after j is the same for every later j that is still before
+  // it, so reuse the last answer instead of searching again.
+  let close = ctx.nextParen;
+  if (close === undefined || close < j + 2) {
+    close = s.indexOf(')', j + 2);
+    if (close < 0) { ctx.noParen = true; mdSpend(s.length - j); return null; }
+    mdSpend(close - j);
+    ctx.nextParen = close;
+  }
+  if (close - j > MD_LINK_SCAN) return null;
   let inner = s.slice(j + 2, close).trim();
   const titled = /^(\S+)\s+(?:"[^"]*"|'[^']*')$/.exec(inner);
   if (titled) inner = titled[1];
@@ -174,8 +222,14 @@ function mdInline(s, depth) {
   const out = [];
   let buf = '';
   const flush = () => { if (buf) { out.push(document.createTextNode(buf)); buf = ''; } };
+  // Closer validity depends only on the closer's own position, so once a
+  // search from i finds no closer, a later opener of the same marker can't
+  // find one either. Remembering that keeps the scan linear.
+  const noCloser = new Set();
+  const linkCtx = {};
   let i = 0;
   while (i < s.length) {
+    mdSpend(1);
     const c = s[i];
 
     if (c === '\\' && i + 1 < s.length && RE_ESCAPABLE.test(s[i + 1])) {
@@ -186,8 +240,10 @@ function mdInline(s, depth) {
       let n = 0;
       while (s[i + n] === '`') n++;
       const fence = '`'.repeat(n);
-      let end = s.indexOf(fence, i + n);
+      let end = noCloser.has(fence) ? -1 : s.indexOf(fence, i + n);
       while (end >= 0 && s[end + n] === '`') end = s.indexOf(fence, end + n + 1);
+      mdSpend(end >= 0 ? end - i : s.length - i);
+      if (end < 0) noCloser.add(fence);
       if (end >= 0) {
         flush();
         let code = s.slice(i + n, end).replace(/\n/g, ' ');
@@ -201,7 +257,7 @@ function mdInline(s, depth) {
 
     if ((c === '[' || (c === '!' && s[i + 1] === '[')) && depth < MD_MAX_DEPTH) {
       const isImage = c === '!';
-      const m = matchLink(s, isImage ? i + 1 : i);
+      const m = matchLink(s, isImage ? i + 1 : i, linkCtx);
       if (m) {
         const href = safeUrl(m.url);
         flush();
@@ -241,8 +297,8 @@ function mdInline(s, depth) {
       else { len = 1; tag = 'em'; }
       const after = s[i + len];
       const leftOk = after && !/\s/.test(after) && !(c === '_' && isWordChar(s[i - 1]));
-      if (leftOk) {
-        const marker = c.repeat(len);
+      const marker = c.repeat(len);
+      if (leftOk && !noCloser.has(marker)) {
         let j = s.indexOf(marker, i + len);
         while (j >= 0) {
           while (s[j + len] === c) j++;          // close at the END of a run: ***x*** = strong(em(x))
@@ -251,6 +307,8 @@ function mdInline(s, depth) {
           if (okClose) break;
           j = s.indexOf(marker, j + len);
         }
+        mdSpend(j >= 0 ? j - i : s.length - i);
+        if (j < 0) noCloser.add(marker);
         if (j >= 0) {
           flush();
           const node = document.createElement(tag);
@@ -394,9 +452,17 @@ function mdBlocks(lines, depth, into) {
   return into;
 }
 
+// Returns a fragment, or null if the render ran over its step budget (the
+// caller then shows plain text).
 function renderMarkdown(text) {
   const frag = document.createDocumentFragment();
-  mdBlocks(String(text == null ? '' : text).replace(/\r\n?/g, '\n').split('\n'), 0, frag);
+  mdSteps = 0;
+  try {
+    mdBlocks(String(text == null ? '' : text).replace(/\r\n?/g, '\n').split('\n'), 0, frag);
+  } catch (e) {
+    if (e instanceof MdBudgetExceeded) return null;
+    throw e;
+  }
   return frag;
 }
 
@@ -1042,24 +1108,37 @@ function messageNode(ev) {
   ]);
   const bodyText = ev.body == null ? '' : String(ev.body);
   const lines = bodyText.split('\n');
-  const md = state.view.markdown;
-  const body = el('div', { cls: md ? 'msg-body md' : 'msg-body' });
+  // Very long bodies start as plain text, with an opt-in to render them.
+  let md = state.view.markdown && bodyText.length <= MD_AUTO_CHARS;
+  const body = el('div', { cls: 'msg-body' });
+  const extras = [];
   const fill = (text) => {
     clear(body);
-    if (md) body.appendChild(renderMarkdown(text));
+    const frag = md ? renderMarkdown(text) : null;
+    body.className = frag ? 'msg-body md' : 'msg-body';
+    if (frag) body.appendChild(frag);
     else body.textContent = text;
+    if (md && !frag) note.textContent = 'Too complex to render as markdown; shown as text.';
   };
-  let content = body;
+  const note = el('div', { cls: 'meta md-note' });
+  let shownText = lines.length > FOLD_LINES ? lines.slice(0, FOLD_LINES).join('\n') : bodyText;
   if (lines.length > FOLD_LINES) {
-    fill(lines.slice(0, FOLD_LINES).join('\n'));
     const more = el('button', {
       type: 'button', cls: 'linklike', text: 'show all ' + lines.length + ' lines',
-      on: { click: () => { fill(bodyText); more.remove(); } },
+      on: { click: () => { shownText = bodyText; fill(bodyText); more.remove(); } },
     });
-    content = el('div', null, [body, more]);
-  } else {
-    fill(bodyText);
+    extras.push(more);
   }
+  if (state.view.markdown && !md) {
+    note.textContent = 'Long message, shown as text. ';
+    const go = el('button', {
+      type: 'button', cls: 'linklike', text: 'render as markdown',
+      on: { click: () => { md = true; go.remove(); note.textContent = ''; fill(shownText); } },
+    });
+    note.appendChild(go);
+  }
+  fill(shownText);
+  const content = el('div', null, [body, ...extras, note]);
   const art = el('article', { cls: 'msg ' + (isHuman ? 'by-human' : 'by-ai'), id: 'seq-' + ev.seq }, [head, content]);
   art.style.setProperty('--hue', String(hueOf(ev.author)));
   return art;
@@ -1413,7 +1492,9 @@ function setEditorPreview(on) {
   const b = $('md-view');
   if (on) {
     clear(p);
-    p.appendChild(renderMarkdown(t.value));
+    const frag = renderMarkdown(t.value);
+    if (frag) p.appendChild(frag);
+    else p.appendChild(el('p', { cls: 'muted', text: 'Too complex to preview as markdown. It will show as plain text.' }));
     if (!t.value.trim()) p.appendChild(el('p', { cls: 'muted', text: 'Nothing to preview yet.' }));
     p.style.setProperty('min-height', t.offsetHeight + 'px');
   }
