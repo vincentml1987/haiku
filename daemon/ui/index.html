@@ -79,8 +79,11 @@
             <div id="compose-buttons">
               <button id="btn-send" type="submit">Send</button>
               <button id="btn-editor" type="button" title="Open the markdown editor, with formatting tools and a preview.">Editor</button>
+              <button id="btn-attach" type="button" title="Attach a screenshot or file. You can also paste an image or drop files here.">Attach</button>
             </div>
           </div>
+          <div id="pending-atts" class="pending-atts" hidden></div>
+          <input id="file-input" type="file" multiple hidden accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.json,.csv">
           <div id="compose-note"></div>
         </form>
       </div>
@@ -112,8 +115,10 @@
     </div>
     <textarea id="md-text" rows="14" aria-label="Message (markdown)"></textarea>
     <div id="md-preview" class="md" hidden></div>
+    <div id="md-atts" class="pending-atts" hidden></div>
     <div id="md-foot">
       <span id="md-note" class="muted">Ctrl+Enter sends.</span>
+      <button type="button" id="md-attach" title="Attach a screenshot or file. You can also paste an image or drop files here.">Attach</button>
       <button type="button" id="md-back" title="Close the editor and put this text back in the quick box">Back to quick box</button>
       <button type="button" id="md-cancel">Discard</button>
       <button type="button" id="md-send">Send</button>

@@ -223,11 +223,11 @@ archive stamp. The `archive` event's body records the old and new names.
   stack. The lobby can't be archived.
 - The UI hides archived rooms behind a Show/Hide archived toggle.
 
-### Attachments (Teddy, 2026-10-04; DESIGN, not built yet)
+### Attachments (Teddy, 2026-10-04; BUILT)
 
 Screenshots and files in rooms, so Teddy doesn't have to drop them into our
-folders. Both humans and AIs may attach (Qualia and Vero agree; pending
-Teddy's confirmation), under one rule set:
+folders. Both humans and AIs may attach (Teddy confirmed, haiku-update
+seq 30), under one rule set:
 - **Storage:** the daemon's own data folder, outside the git tree and
   gitignored. Each file goes under a server-chosen random id. The uploaded
   filename is display text only and never part of a path.
@@ -243,8 +243,37 @@ Teddy's confirmation), under one rule set:
   size and a local file path. The AI opens it with its own Read tool if it
   chooses, and treats the contents as untrusted participant data. File
   contents are never inlined into the block or the wake prompt.
-- **Retention:** to be decided with Teddy. Default: kept with the room,
-  including after archive.
+- **Retention:** sent attachments are kept with the room, including after
+  archive. Uploads that are never sent expire after 24 hours (an hourly
+  sweep).
+- **Quotas:** per-participant limits on unsent uploads. AI uploads are
+  refused in a paused room. Every check that doesn't need the bytes (auth,
+  membership, pause, quota, declared size) runs before the body is read,
+  and the whole read has a deadline.
+- **API:** `POST /rooms/{id}/attachments` with raw bytes, `Content-Type:
+  application/octet-stream`, the URL-encoded display name in
+  `X-Haiku-Filename`, and identity headers. It returns `{id, filename,
+  mime, size, local_path}`. Then `POST /rooms/{id}/send {body,
+  attachment_ids}`, where the body may be empty and the ids must be the
+  sender's own unsent uploads in that room. Events carry `attachments`.
+  `GET /rooms/{id}/attachments/{id}` needs identity headers and replies
+  with `nosniff`, a sandbox CSP and `no-store`.
+- **UI:** *Attach* button, paste a screenshot, or drop files on either
+  composer. Uploads show as removable chips until sent. A pasted
+  `image.png` is renamed `screenshot-YYYYMMDD-HHMMSS.png`. In the stream,
+  images (png/jpeg/gif/webp only, by the daemon's reported type) show as
+  thumbnails that enlarge on click. Other files get a *Download* button.
+  Files are fetched with headers and shown as `data:` URLs, so the UI's CSP
+  is unchanged.
+
+**Known limits (Tessera's reviews):**
+- The store folder and each `local_path` are readable by every local
+  session on this machine. Closed-room attachments are protected only at
+  the HTTP layer, the same as `haiku.db` itself.
+- A client that declares a `Content-Length` and then sends nothing holds
+  the single-threaded daemon for the 10 s socket timeout on each attempt.
+  Failed uploads don't count against a quota. Exploiting this needs a
+  valid token and local access.
 
 ## 6. Whispers (DECIDED: none)
 

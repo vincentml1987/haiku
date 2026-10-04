@@ -291,6 +291,32 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 #md-note { flex: 1; font-size: 13px; }
 #md-send { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 
+/* attachments (2026-10-04) */
+.pending-atts { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+.pending-atts[hidden] { display: none; }
+.att-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg);
+  font-size: 13px;
+}
+.att-chip.uploading { opacity: 0.7; border-style: dashed; }
+.att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.att-remove { text-decoration: none; font-size: 16px; line-height: 1; color: var(--muted); }
+.atts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.att-image { margin: 0; display: flex; flex-direction: column; gap: 2px; }
+.att-image img {
+  display: block; max-width: 320px; max-height: 240px; cursor: zoom-in;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg);
+}
+.att-image img.big { max-width: min(100%, 1200px); max-height: none; cursor: zoom-out; }
+.att-image figcaption { display: flex; gap: 6px; align-items: baseline; font-size: 13px; }
+.att-file {
+  display: flex; align-items: center; align-self: flex-start; gap: 8px; padding: 4px 8px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg);
+}
+.att-download { font-size: 13px; padding: 1px 8px; }
+#composer.dropping, #md-dialog.dropping { outline: 2px dashed var(--accent); outline-offset: -4px; }
+
 /* narrow screens: one pane at a time, rooms/people as drawers */
 @media (max-width: 860px) {
   #btn-rooms, #btn-people { display: inline-block; }

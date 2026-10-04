@@ -45,6 +45,7 @@ const state = {
   isHuman: null,         // null = not checked yet; humans get the admin room list
   allRooms: [],          // GET /rooms (humans see every room)
   view: { markdown: true, showArchived: false },
+  pending: [],           // uploaded, not yet sent attachments for the open room
 };
 
 const $ = (id) => document.getElementById(id);
@@ -889,6 +890,9 @@ async function openRoom(id) {
   state.lastSeq = 0;
   state.dividerAfterSeq = null;
   state.to = new Set();
+  // Uploads belong to one room; unsent ones the daemon expires on its own.
+  state.pending = [];
+  renderPending();
   state.stickToBottom = true;
   state.unseenBelow = 0;
   state.bannerKey = null;
@@ -1077,6 +1081,7 @@ function finishHead(r) {
   $('compose').disabled = r.state === 'archived';
   $('btn-send').disabled = r.state === 'archived';
   $('btn-editor').disabled = r.state === 'archived';
+  $('btn-attach').disabled = r.state === 'archived';
   const note = $('compose-note');
   note.textContent = r.state === 'paused' ? 'Room is paused. Your message will be posted but will not resume it.' : '';
 }
@@ -1141,6 +1146,8 @@ function messageNode(ev) {
   }
   fill(shownText);
   const content = el('div', null, [body, ...extras, note]);
+  const atts = Array.isArray(ev.attachments) ? ev.attachments : [];
+  if (atts.length) content.appendChild(attachmentsNode(atts));
   const art = el('article', { cls: 'msg ' + (isHuman ? 'by-human' : 'by-ai'), id: 'seq-' + ev.seq }, [head, content]);
   art.style.setProperty('--hue', String(hueOf(ev.author)));
   return art;
@@ -1423,11 +1430,18 @@ function renderComposerEffect() {
 // true on success; on failure writes the reason into `noteEl`.
 async function sendBody(text, noteEl) {
   const body = text.trim();
-  if (!body || !state.roomId) return false;
+  if (!state.roomId || (!body && !state.pending.length)) return false;
+  if (state.pending.some((p) => p.uploading)) {
+    noteEl.textContent = 'Wait for the upload to finish, then send.';
+    return false;
+  }
   const payload = { body };
   if (state.to.size) payload.addressed_to = [...state.to];
+  if (state.pending.length) payload.attachment_ids = state.pending.map((p) => p.id);
   try {
     const res = await api('POST', '/rooms/' + encodeURIComponent(state.roomId) + '/send', payload);
+    state.pending = [];
+    renderPending();
     setBanner('');
     $('compose-note').textContent = 'Sent as #' + res.seq + '.';
     state.stickToBottom = true;
@@ -1448,6 +1462,215 @@ async function sendCurrent() {
     if (await sendBody(ta.value, $('compose-note'))) ta.value = '';
   } finally {
     $('btn-send').disabled = !!(state.room && state.room.state === 'archived');
+  }
+}
+
+/* ---------- attachments (Teddy, 2026-10-04) ----------
+ *
+ * Upload: raw bytes to POST /rooms/{id}/attachments (octet-stream, the
+ * display name URL-encoded in X-Haiku-Filename); the daemon checks type by
+ * content and returns an id that the next send carries in attachment_ids.
+ * Display: attachment files need identity headers, so they're fetched with
+ * fetch() and shown as data: URLs (the CSP already allows img-src data:).
+ * Only daemon-reported image types (no SVG on the allowlist) become <img>;
+ * everything else is a download button. Filenames are text, never markup,
+ * and are cleaned before use as a download name.
+ */
+
+const ATTACH_MAX_BYTES = 20 * 1024 * 1024;
+const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const attachCache = new Map(); // "room/att" -> Promise<data URL>
+
+function fmtSize(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function safeFilename(name) {
+  const t = cleanName(name).replace(/[\\/:*?"<>|]/g, '_');
+  return t || 'attachment';
+}
+
+async function uploadOne(file) {
+  const roomId = state.roomId;
+  let name = file.name || '';
+  // Pasted screenshots arrive as "image.png"; give them a findable name.
+  if (!name || /^image\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+    const d = new Date();
+    const pad = (x) => String(x).padStart(2, '0');
+    name = 'screenshot-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' +
+      pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.' + ext;
+  }
+  const entry = { id: null, filename: name, size: file.size, mime: file.type, uploading: true };
+  if (file.size > ATTACH_MAX_BYTES) {
+    setBanner('"' + cleanName(name) + '" is ' + fmtSize(file.size) + '; the limit is 20 MB.');
+    return;
+  }
+  state.pending.push(entry);
+  renderPending();
+  try {
+    const res = await fetch('/rooms/' + encodeURIComponent(roomId) + '/attachments', {
+      method: 'POST',
+      headers: {
+        'X-Haiku-Participant': state.creds.name,
+        'X-Haiku-Token': state.creds.token,
+        'Content-Type': 'application/octet-stream',
+        'X-Haiku-Filename': encodeURIComponent(name),
+      },
+      body: file,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* empty */ }
+    if (res.status === 401) { signOut('Your credentials were rejected. Run the login command again.'); return; }
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (state.roomId !== roomId) return; // switched rooms mid-upload; the daemon expires it
+    Object.assign(entry, { id: data.id, filename: data.filename, size: data.size, mime: data.mime, uploading: false });
+  } catch (e) {
+    state.pending = state.pending.filter((p) => p !== entry);
+    setBanner('Could not attach "' + cleanName(name) + '": ' + e.message);
+  }
+  renderPending();
+}
+
+async function uploadFiles(files) {
+  if (!state.roomId || !files || !files.length) return;
+  if (state.room && state.room.state === 'archived') { setBanner('This room is archived; nothing can be attached.'); return; }
+  for (const f of [...files]) await uploadOne(f);
+}
+
+function renderPending() {
+  for (const boxId of ['pending-atts', 'md-atts']) {
+    const box = $(boxId);
+    if (!box) continue;
+    clear(box);
+    box.hidden = state.pending.length === 0;
+    for (const p of state.pending) {
+      box.appendChild(el('span', { cls: 'att-chip' + (p.uploading ? ' uploading' : '') }, [
+        el('span', { cls: 'att-name', text: p.filename, title: p.filename }),
+        el('span', { cls: 'meta', text: p.uploading ? 'uploading…' : fmtSize(p.size) }),
+        p.uploading ? null : el('button', {
+          type: 'button', cls: 'linklike att-remove', text: '×',
+          title: 'Don\'t send this attachment',
+          aria: { label: 'Remove ' + cleanName(p.filename) },
+          on: { click: () => { state.pending = state.pending.filter((q) => q !== p); renderPending(); } },
+        }),
+      ]));
+    }
+  }
+}
+
+function fetchAttachment(roomId, att) {
+  const key = roomId + '/' + att.id;
+  if (attachCache.has(key)) return attachCache.get(key);
+  const p = (async () => {
+    const res = await fetch('/rooms/' + encodeURIComponent(roomId) + '/attachments/' + encodeURIComponent(att.id), {
+      headers: { 'X-Haiku-Participant': state.creds.name, 'X-Haiku-Token': state.creds.token },
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    return await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(new Error('could not read file'));
+      r.readAsDataURL(blob);
+    });
+  })();
+  attachCache.set(key, p);
+  p.catch(() => attachCache.delete(key));
+  return p;
+}
+
+function attachmentsNode(atts) {
+  const roomId = state.roomId;
+  const box = el('div', { cls: 'atts' });
+  for (const a of atts) {
+    if (!a || !/^[0-9a-f]{32}$/.test(String(a.id))) continue;
+    const label = el('span', { cls: 'att-name', text: a.filename, title: a.filename });
+    const size = el('span', { cls: 'meta', text: fmtSize(a.size) });
+    if (IMAGE_MIMES.has(a.mime)) {
+      const fig = el('figure', { cls: 'att-image' });
+      const img = document.createElement('img');
+      img.alt = String(a.filename || 'image');
+      img.title = 'Click to enlarge or shrink';
+      img.addEventListener('click', () => img.classList.toggle('big'));
+      const status = el('span', { cls: 'meta', text: 'loading…' });
+      fig.appendChild(img);
+      fig.appendChild(el('figcaption', null, [label, size, status]));
+      fetchAttachment(roomId, a).then((url) => {
+        if (url.startsWith('data:image/')) { img.src = url; status.remove(); } else status.textContent = 'not an image';
+      }).catch((e) => { status.textContent = 'could not load (' + e.message + ')'; });
+      box.appendChild(fig);
+    } else {
+      const btn = el('button', {
+        type: 'button', cls: 'att-download', text: 'Download',
+        on: {
+          click: async () => {
+            btn.disabled = true;
+            try {
+              const url = await fetchAttachment(roomId, a);
+              const link = document.createElement('a');
+              link.href = url;
+              link.download = safeFilename(a.filename);
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+            } catch (e) {
+              setBanner('Download failed: ' + e.message);
+            } finally {
+              btn.disabled = false;
+            }
+          },
+        },
+      });
+      box.appendChild(el('div', { cls: 'att-file' }, [label, size, btn]));
+    }
+  }
+  return box;
+}
+
+function filesFromTransfer(dt) {
+  if (!dt) return [];
+  if (dt.files && dt.files.length) return [...dt.files];
+  const out = [];
+  for (const it of dt.items || []) if (it.kind === 'file') { const f = it.getAsFile(); if (f) out.push(f); }
+  return out;
+}
+
+function wireAttachments() {
+  const input = $('file-input');
+  $('btn-attach').addEventListener('click', () => input.click());
+  $('md-attach').addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
+    const files = [...input.files];
+    input.value = '';
+    await uploadFiles(files);
+  });
+  // Paste: only intercept when the clipboard holds files (a screenshot);
+  // ordinary text paste is left alone.
+  for (const id of ['compose', 'md-text']) {
+    $(id).addEventListener('paste', (e) => {
+      const files = filesFromTransfer(e.clipboardData);
+      if (!files.length) return;
+      e.preventDefault();
+      uploadFiles(files);
+    });
+  }
+  for (const id of ['composer', 'md-dialog']) {
+    const zone = $(id);
+    zone.addEventListener('dragover', (e) => {
+      if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); zone.classList.add('dropping'); }
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dropping'));
+    zone.addEventListener('drop', (e) => {
+      zone.classList.remove('dropping');
+      const files = filesFromTransfer(e.dataTransfer);
+      if (!files.length) return;
+      e.preventDefault();
+      uploadFiles(files);
+    });
   }
 }
 
@@ -1699,6 +1922,7 @@ function wire() {
   $('nr-cancel').addEventListener('click', () => { $('new-room').reset(); showNewRoom(false); });
   $('new-room').addEventListener('submit', (e) => { e.preventDefault(); createRoom(); });
   wireEditor();
+  wireAttachments();
   $('btn-logout').addEventListener('click', () => signOut(''));
   $('btn-rooms').addEventListener('click', () => document.body.classList.toggle('show-rooms'));
   $('btn-people').addEventListener('click', () => document.body.classList.toggle('show-people'));
