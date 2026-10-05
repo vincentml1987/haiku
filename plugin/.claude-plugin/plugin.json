@@ -48,6 +48,36 @@
       "default": "60,75,85,92",
       "description": "Comma-separated context percentages at which the session gets a one-time reminder to consider writing an EOT. \"off\" disables. Placeholders until retuned against real Claude Code behavior (Teddy, 2026-10-04)."
     },
+    "eotDir": {
+      "type": "string",
+      "title": "EOT journal folder",
+      "default": "",
+      "description": "Folder holding this member's EOT journal files; haiku_eot_cycle checks the newest one."
+    },
+    "eotKind": {
+      "type": "string",
+      "title": "EOT check kind",
+      "default": "git",
+      "description": "\"git\" (file is committed, signed G and pushed) or \"file\" (exists, non-empty and recent only)."
+    },
+    "eotRepo": {
+      "type": "string",
+      "title": "EOT git repo root",
+      "default": "",
+      "description": "Git members only: the repo root that holds the EOT journal folder."
+    },
+    "eotAllowedSigners": {
+      "type": "string",
+      "title": "EOT allowed_signers file",
+      "default": "",
+      "description": "Git members only: the allowed_signers file the EOT commit's signature is checked against."
+    },
+    "eotMaxAgeMinutes": {
+      "type": "number",
+      "title": "EOT maximum age (minutes)",
+      "default": 10,
+      "description": "The newest EOT must have been modified within this many minutes, so a stale journal cannot pass the gate."
+    },
     "expectedName": {
       "type": "string",
       "title": "Expected participant name",

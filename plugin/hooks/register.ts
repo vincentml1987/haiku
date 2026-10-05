@@ -49,6 +49,7 @@ import {
   mutedRoomBreakthrough,
 } from './wake'
 import { type ReminderState, EMPTY_REMINDER_STATE, parseThresholds, decideReminder } from './reminder'
+import { type GitFacts, parseEotConfig, pickLatest, evaluateGate, formatGate, planText } from './eotcycle'
 
 /**
  * Builds the fetch closure client.ts's functions take. $.http.fetch is
@@ -289,6 +290,38 @@ async function contextReminder($: Engine, options: Record<string, unknown>) {
   }
 }
 
+/**
+ * haiku_eot_cycle (eot-initialization-automation, 2026-10-04). Runs the
+ * member's own gate (eotcycle.ts has the rules) over their newest EOT. For now
+ * it is dry-run only: a passing gate reports what a live cycle would do and
+ * clears nothing. A live clear waits on the test of whether a prompt submitted
+ * after /clear reaches the fresh session. Fails closed on any problem.
+ */
+async function eotCycle($: Engine, options: Record<string, unknown>, dryRun: boolean): Promise<string> {
+  const parsed = parseEotConfig(options)
+  if (!parsed.ok) return `EOT gate refused: ${parsed.reason}. Nothing was cleared.`
+  const cfg = parsed.config
+  const latest = pickLatest(await $.fs.list(cfg.dir), cfg.namePattern)
+  let git: GitFacts | null = null
+  if (cfg.kind === 'git' && latest) {
+    const file = `${cfg.dir.replace(/[\\/]+$/, '')}/${latest.name}`
+    const run = (argv: string[]) => $.process.run(['git', '-C', cfg.repo, ...argv])
+    const log = await run(['-c', `gpg.ssh.allowedSignersFile=${cfg.allowedSigners}`, 'log', '-1', '--format=%G?', '--', file])
+    const dirty = await run(['status', '--porcelain', '--', file])
+    const branch = await run(['status', '-sb'])
+    git = {
+      signature: log.exitCode === 0 ? log.stdout.trim() : '',
+      isDirty: dirty.exitCode !== 0 || dirty.stdout.trim() !== '',
+      isAhead: branch.exitCode !== 0 || /\bahead\b/.test(branch.stdout.split('\n')[0] ?? ''),
+    }
+  }
+  const gate = evaluateGate(cfg, latest, git, await $.clock.now())
+  const report = formatGate(gate)
+  if (!gate.ok) return `EOT gate FAILED, nothing cleared.\n${report}`
+  if (!dryRun) return `EOT gate passed, but a live clear is not enabled yet (dry-run only until the submit-after-clear test is done). Nothing was cleared.\n${report}`
+  return `DRY RUN: EOT gate passed for ${gate.file}.\n${report}\nA live cycle would ${planText()}. Nothing was cleared.`
+}
+
 /** Level 1 (spec 3a): Teddy's per-identity ceiling. Default OFF; read at
  * launch from the settings file, never writable by the session itself. */
 function wakeCeiling(options: Record<string, unknown>): boolean {
@@ -436,6 +469,11 @@ export const register: Register = (on, options) => {
       description: 'Turn your own HAIKU auto-wake on or off. "on" only works if your settings file already allows autoWake; you cannot raise that yourself. "off" means not now.',
       inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['on', 'off', 'status'] } }, required: ['mode'] },
     })
+    await $.tool.register({
+      name: 'haiku_eot_cycle',
+      description: 'Check your newest EOT against your gate. Dry run only for now; never clears. Write your EOT first.',
+      inputSchema: { type: 'object', properties: { dry_run: { type: 'boolean' } } },
+    })
 
     poller?.cancel()
     poller = undefined
@@ -498,6 +536,14 @@ export const register: Register = (on, options) => {
       // a reminder is a nicety: never block a prompt over it
     }
     return next(e)
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_eot_cycle' }, async ($, e) => {
+    try {
+      return { result: await eotCycle($, options, e.dry_run !== false) }
+    } catch (err) {
+      return errorResult(err)
+    }
   })
 
   on('tool.call', { tool: 'mcp__haiku__haiku_autowake' }, async ($, e) => {
