@@ -348,6 +348,37 @@ def h_usage(conn, params, body, headers):
     return out
 
 
+import os
+
+# Local clone of the moot-tasks repo. Display only: the daemon reads
+# ROLLUP.json and never runs git, the network, or any entry's `check`.
+TASKS_DIR = Path(os.environ.get(
+    "HAIKU_TASKS_DIR",
+    Path(__file__).parent.parent.parent.parent / "Claude Code AIs" / "moot-tasks"))
+TASKS_MAX_BYTES = 2_000_000
+
+
+@route("GET", r"/tasks")
+def h_tasks(conn, params, body, headers):
+    """The keeper's generated roll-up, as written by moot-tasks/rollup.py."""
+    caller, token = _auth_headers(headers)
+    if not db.authenticate(conn, caller, token):
+        raise db.Forbidden("authentication required")
+    f = Path(TASKS_DIR) / "ROLLUP.json"
+    try:
+        if f.stat().st_size > TASKS_MAX_BYTES:
+            raise ClientError(500, "ROLLUP.json is too large")
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ClientError(404, "no ROLLUP.json at the configured tasks folder")
+    except (OSError, ValueError):
+        raise ClientError(500, "ROLLUP.json could not be read")
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        raise ClientError(500, "ROLLUP.json has an unexpected shape")
+    return {"generated": data.get("generated"), "spot_check": data.get("spot_check"),
+            "entries": [e for e in data["entries"] if isinstance(e, dict)]}
+
+
 def _host_ok(host_header: str, port: int) -> bool:
     host = (host_header or "").split(":")[0].strip("[]")
     return host in ("127.0.0.1", "localhost", "::1")
