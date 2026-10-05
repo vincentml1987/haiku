@@ -353,3 +353,23 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 @media (prefers-reduced-motion: no-preference) {
   .msg { transition: outline-color 0.3s; }
 }
+
+#tasks-dialog {
+  width: min(900px, calc(100vw - 24px)); max-width: none; padding: 0;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); color: var(--text);
+}
+#tasks-dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+#tasks-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; max-height: calc(100vh - 32px); }
+#tasks-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#tasks-body { overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+#tasks-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.task-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+.task-card h3 { margin: 0 0 8px; font-size: 15px; }
+.task { padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.task:first-of-type { border-top: 0; }
+.task-title { font-weight: 600; }
+.task-line { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 2px; }
+.task-flag { font-size: 11px; border: 1px solid var(--line); border-radius: 8px; padding: 0 6px; }
+.task-flag.warn { font-weight: 700; }
+.task-check { font-family: ui-monospace, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }

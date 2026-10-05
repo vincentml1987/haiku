@@ -1372,6 +1372,75 @@ const SETTINGS_FIELD_SPECS = {
   usageDataDir: { label: 'Usage data folder', type: 'text' },
 };
 
+// Moot tasks view (read-only). GET /tasks serves moot-tasks' ROLLUP.json:
+// {generated, spot_check, entries[]}. `check` values are shown as text and
+// never run or linked.
+async function openTasks() {
+  $('tasks-dialog').showModal();
+  await loadTasks();
+}
+
+async function loadTasks() {
+  const body = $('tasks-body');
+  clear(body);
+  $('tasks-meta').textContent = '';
+  body.appendChild(el('p', { cls: 'muted', text: 'Loading…' }));
+  try {
+    renderTasksBody(await api('GET', '/tasks'));
+  } catch (e) {
+    clear(body);
+    body.appendChild(el('p', { cls: 'muted', text: 'Could not load tasks: ' + e.message }));
+  }
+}
+
+function renderTasksBody(data) {
+  const body = $('tasks-body');
+  clear(body);
+  const entries = data.entries || [];
+  const bits = [];
+  if (data.generated) bits.push('generated ' + data.generated);
+  bits.push('keeper spot-check: ' + (data.spot_check || 'never'));
+  bits.push(entries.length + ' entries');
+  $('tasks-meta').textContent = bits.join(' · ');
+  if (!entries.length) {
+    body.appendChild(el('p', { cls: 'muted', text: 'No tasks yet.' }));
+    return;
+  }
+  const byOwner = new Map();
+  for (const t of entries) {
+    const o = t.owner || '(no owner)';
+    if (!byOwner.has(o)) byOwner.set(o, []);
+    byOwner.get(o).push(t);
+  }
+  for (const [owner, list] of byOwner) {
+    const card = el('div', { cls: 'task-card' });
+    card.appendChild(el('h3', { text: owner }));
+    for (const t of list) card.appendChild(buildTask(t));
+    body.appendChild(card);
+  }
+}
+
+function buildTask(t) {
+  const row = el('div', { cls: 'task' });
+  row.appendChild(el('div', { cls: 'task-title', text: (t.id ? t.id + ' · ' : '') + (t.title || '') }));
+  const line = el('div', { cls: 'task-line muted' });
+  line.appendChild(el('span', { text: 'status: ' + (t.status || '?') }));
+  if (t.depends_on) line.appendChild(el('span', { text: 'depends on: ' + t.depends_on }));
+  if (t.last_verified) {
+    const age = t.age_days != null ? ' (' + t.age_days + 'd ago)' : '';
+    line.appendChild(el('span', { text: 'verified: ' + t.last_verified + age }));
+  }
+  const flags = Array.isArray(t.flags) ? t.flags : (t.flags ? [t.flags] : []);
+  for (const f of flags) {
+    line.appendChild(el('span', { cls: 'task-flag warn', text: String(f) }));
+  }
+  row.appendChild(line);
+  if (t.evidence) row.appendChild(el('div', { cls: 'muted', text: 'evidence: ' + t.evidence }));
+  if (t.check) row.appendChild(el('div', { cls: 'task-check muted', text: 'check: ' + t.check }));
+  if (t.notes) row.appendChild(el('div', { text: t.notes }));
+  return row;
+}
+
 async function openSettings() {
   const body = $('settings-body');
   clear(body);
@@ -2196,6 +2265,9 @@ function wire() {
   $('btn-rooms').addEventListener('click', () => document.body.classList.toggle('show-rooms'));
   $('btn-people').addEventListener('click', () => document.body.classList.toggle('show-people'));
   $('btn-settings').addEventListener('click', openSettings);
+  $('btn-tasks').addEventListener('click', openTasks);
+  $('tasks-refresh').addEventListener('click', loadTasks);
+  $('tasks-close').addEventListener('click', () => $('tasks-dialog').close());
   $('settings-close').addEventListener('click', () => $('settings-dialog').close());
 }
 

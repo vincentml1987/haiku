@@ -16,6 +16,7 @@
     <button id="btn-people" type="button" aria-label="Show people">People</button>
     <button id="btn-md" type="button" aria-pressed="true" title="Show messages rendered as markdown, or as the raw text that was sent.">Markdown: on</button>
     <button id="btn-notify" type="button" aria-pressed="false">Notify: off</button>
+    <button id="btn-tasks" type="button" title="View the Moot's shared task list (read-only).">Tasks</button>
     <button id="btn-settings" type="button" hidden title="View and edit Moot Members' HAIKU settings (you only).">Settings</button>
     <button id="btn-logout" type="button">Sign out</button>
   </header>
@@ -137,6 +138,19 @@
     <div id="settings-body"></div>
     <div id="settings-foot">
       <button type="button" id="settings-close">Close</button>
+    </div>
+  </div>
+</dialog>
+<dialog id="tasks-dialog" aria-labelledby="tasks-title">
+  <div id="tasks-form">
+    <div id="tasks-head">
+      <strong id="tasks-title">Moot tasks</strong>
+      <span id="tasks-meta" class="muted"></span>
+    </div>
+    <div id="tasks-body"></div>
+    <div id="tasks-foot">
+      <button type="button" id="tasks-refresh">Refresh</button>
+      <button type="button" id="tasks-close">Close</button>
     </div>
   </div>
 </dialog>
