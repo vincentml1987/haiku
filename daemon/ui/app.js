@@ -18,6 +18,8 @@ const LS_VIEW = 'haiku.view';
 const POLL_ACTIVE_MS = 2000;
 const POLL_BG_MS = 15000;
 const SUMMARY_MS = 5000;
+const USAGE_MS = 60000;
+const USAGE_STALE_MS = 10 * 60 * 1000;
 const FOLD_LINES = 40;
 const FIRST_LOAD_TAIL = 200;
 
@@ -41,6 +43,7 @@ const state = {
   peopleKey: null,       // what the people panel currently shows
   pollTimer: null,
   summaryTimer: null,
+  usageTimer: null,
   polling: false,
   isHuman: null,         // null = not checked yet; humans get the admin room list
   allRooms: [],          // GET /rooms (humans see every room)
@@ -534,6 +537,10 @@ function signOut(message) {
   $('layout').hidden = true;
   $('signin').hidden = false;
   $('whoami').textContent = '';
+  if (state.usageTimer) clearInterval(state.usageTimer);
+  state.usageTimer = null;
+  $('usage-readout').textContent = '';
+  $('usage-readout').classList.remove('stale');
   setBanner(message || '');
   document.title = 'HAIKU';
 }
@@ -542,6 +549,36 @@ function setBanner(text) {
   const b = $('banner');
   b.textContent = text;
   b.hidden = !text;
+}
+
+// Header usage readout (Session/Week %, from GET /usage). 404/empty just
+// means no member has usageDataDir set yet — quiet, not an error banner.
+async function refreshUsage() {
+  const usageEl = $('usage-readout');
+  if (!usageEl) return;
+  let data;
+  try {
+    data = await api('GET', '/usage');
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 204)) {
+      usageEl.textContent = '';
+      return;
+    }
+    if (e instanceof ApiError && e.status === 401) throw e;
+    return; // transient fetch failure: leave the last good reading showing
+  }
+  if (!data || !data.five_hour || !data.seven_day) {
+    usageEl.textContent = '';
+    return;
+  }
+  const parts = [
+    'Session ' + Math.round(data.five_hour.percentUsed) + '% (resets ' + fmtTime(data.five_hour.resetsAt) + ')',
+    'Week ' + Math.round(data.seven_day.percentUsed) + '% (resets ' + fmtTime(data.seven_day.resetsAt) + ')',
+  ];
+  usageEl.textContent = parts.join(' · ');
+  const ts = new Date(data.ts);
+  const stale = isNaN(ts) || (Date.now() - ts.getTime()) > USAGE_STALE_MS;
+  usageEl.classList.toggle('stale', stale);
 }
 
 /* ---------- room list ---------- */
@@ -579,6 +616,7 @@ async function refreshSummary() {
       if (e instanceof ApiError && e.status === 401) throw e;
     }
   }
+  $('btn-settings').hidden = !state.isHuman;
   checkNotifications();
   renderRoomList();
   updateTitle();
@@ -1314,6 +1352,133 @@ function renderPeople() {
   }
 }
 
+/* ---------- Moot Member settings (human-only; 2026-10-05) ----------
+ *
+ * GET/PUT /settings never carry a participant's token — the daemon
+ * whitelists which option keys this UI may read or write, so a long-lived
+ * credential can never reach the browser through this panel. See
+ * haiku-settings-ui room for the design discussion with Formica.
+ */
+
+const SETTINGS_FIELD_SPECS = {
+  autoWake: { label: 'Auto-wake', type: 'bool' },
+  reminderThresholds: { label: 'Reminder thresholds (% comma-separated, or "off")', type: 'text' },
+  eotDir: { label: 'EOT journal folder', type: 'text' },
+  eotKind: { label: 'EOT gate kind', type: 'select', options: ['git', 'file'] },
+  eotRepo: { label: 'EOT repo root (git kind only)', type: 'text' },
+  eotAllowedSigners: { label: 'EOT allowed_signers path (git kind only)', type: 'text' },
+  eotMaxAgeMinutes: { label: 'EOT freshness limit (minutes)', type: 'number' },
+  eotCycleLive: { label: 'Live EOT clear enabled', type: 'bool' },
+  usageDataDir: { label: 'Usage data folder', type: 'text' },
+};
+
+async function openSettings() {
+  const body = $('settings-body');
+  clear(body);
+  body.appendChild(el('p', { cls: 'muted', text: 'Loading…' }));
+  $('settings-dialog').showModal();
+  try {
+    const data = await api('GET', '/settings');
+    renderSettingsBody(data);
+  } catch (e) {
+    clear(body);
+    body.appendChild(el('p', { cls: 'muted', text: 'Could not load settings: ' + e.message }));
+  }
+}
+
+function renderSettingsBody(data) {
+  const body = $('settings-body');
+  clear(body);
+  const members = data.members || [];
+  const editable = data.editable || Object.keys(SETTINGS_FIELD_SPECS);
+  if (data.note) body.appendChild(el('p', { cls: 'muted', text: data.note }));
+  if (!members.length) {
+    body.appendChild(el('p', { cls: 'muted', text: 'No members found.' }));
+    return;
+  }
+  for (const m of members) body.appendChild(buildSettingsCard(m, editable));
+}
+
+function buildSettingsCard(member, editable) {
+  const card = el('div', { cls: 'settings-card' });
+  card.appendChild(el('h3', { text: member.name }));
+  if (member.in_sync === false) {
+    card.appendChild(el('p', {
+      cls: 'settings-card-status',
+      text: 'Warning: the haiku and haiku@inline blocks disagree on disk. Saving here makes them match.',
+    }));
+  }
+  const ro = member.read_only || {};
+  const roBits = [];
+  if (ro.expectedHome) roBits.push('home: ' + ro.expectedHome);
+  if (ro.daemonUrl) roBits.push('url: ' + ro.daemonUrl);
+  if (member.has_token != null) roBits.push(member.has_token ? 'token: set' : 'token: missing');
+  if (roBits.length) card.appendChild(el('p', { cls: 'muted', text: roBits.join(' · ') }));
+
+  const opts = member.options || {};
+  const inputs = {};
+  for (const key of editable) {
+    const spec = SETTINGS_FIELD_SPECS[key] || { label: key, type: 'text' };
+    const current = opts[key];
+    let control;
+    if (spec.type === 'bool') {
+      control = el('input', { type: 'checkbox' });
+      control.checked = !!current;
+      card.appendChild(el('div', { cls: 'settings-field checkbox' }, [control, el('label', { text: spec.label })]));
+    } else if (spec.type === 'select') {
+      control = document.createElement('select');
+      control.appendChild(new Option('(unset)', ''));
+      for (const o of spec.options) control.appendChild(new Option(o, o, false, current === o));
+      if (current == null) control.value = '';
+      card.appendChild(el('div', { cls: 'settings-field' }, [el('label', { text: spec.label }), control]));
+    } else {
+      control = el('input', { type: spec.type === 'number' ? 'number' : 'text' });
+      control.value = current != null ? String(current) : '';
+      card.appendChild(el('div', { cls: 'settings-field' }, [el('label', { text: spec.label }), control]));
+    }
+    inputs[key] = { control, type: spec.type, original: current == null ? null : current };
+  }
+  const status = el('span', { cls: 'settings-card-status muted' });
+  const save = el('button', { type: 'button', text: 'Save', on: { click: () => saveSettingsCard(member.name, inputs, status) } });
+  card.appendChild(el('div', { cls: 'settings-card-foot' }, [save, status]));
+  return card;
+}
+
+async function saveSettingsCard(name, inputs, status) {
+  const changes = {};
+  for (const key of Object.keys(inputs)) {
+    const { control, type, original } = inputs[key];
+    let value;
+    let changed;
+    if (type === 'bool') {
+      value = control.checked;
+      changed = value !== !!original;
+    } else if (type === 'number') {
+      value = control.value === '' ? null : Number(control.value);
+      if (value !== null && Number.isNaN(value)) { status.textContent = key + ' must be a number.'; return; }
+      changed = value !== (original == null ? null : original);
+    } else {
+      value = control.value === '' ? null : control.value;
+      changed = value !== (original == null ? null : original);
+    }
+    if (changed) changes[key] = value;
+  }
+  if (!Object.keys(changes).length) { status.textContent = 'No changes.'; return; }
+  status.textContent = 'Saving…';
+  try {
+    const resp = await api('PUT', '/settings/' + encodeURIComponent(name), { changes });
+    const updated = (resp && resp.member) || resp || {};
+    const newOpts = updated.options || {};
+    for (const key of Object.keys(inputs)) {
+      if (key in newOpts) inputs[key].original = newOpts[key];
+      else if (key in changes) inputs[key].original = changes[key] === undefined ? null : changes[key];
+    }
+    status.textContent = 'Saved. Takes effect on next relaunch.';
+  } catch (e) {
+    status.textContent = 'Could not save: ' + e.message;
+  }
+}
+
 async function loadWake() {
   state.wakeLoadedAt = Date.now();
   try {
@@ -2030,6 +2195,8 @@ function wire() {
   $('btn-logout').addEventListener('click', () => signOut(''));
   $('btn-rooms').addEventListener('click', () => document.body.classList.toggle('show-rooms'));
   $('btn-people').addEventListener('click', () => document.body.classList.toggle('show-people'));
+  $('btn-settings').addEventListener('click', openSettings);
+  $('settings-close').addEventListener('click', () => $('settings-dialog').close());
 }
 
 async function boot() {
@@ -2049,6 +2216,8 @@ async function boot() {
     if (!(e instanceof ApiError && e.status === 401)) setBanner('Could not reach the daemon: ' + e.message);
   }
   state.summaryTimer = setInterval(summaryTick, SUMMARY_MS);
+  refreshUsage().catch(onPollError);
+  state.usageTimer = setInterval(() => refreshUsage().catch(onPollError), USAGE_MS);
 }
 
 boot();

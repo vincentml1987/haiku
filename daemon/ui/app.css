@@ -65,7 +65,9 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
   padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
 #brand { font-weight: 700; letter-spacing: 0.08em; }
-#whoami { color: var(--muted); flex: 1; }
+#whoami { color: var(--muted); }
+#usage-readout { color: var(--muted); flex: 1; font-size: 0.9em; }
+#usage-readout.stale { opacity: 0.55; }
 #btn-rooms, #btn-people { display: none; }
 
 #banner {
@@ -290,6 +292,27 @@ code { background: var(--panel); border: 1px solid var(--line); border-radius: 4
 #md-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 #md-note { flex: 1; font-size: 13px; }
 #md-send { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
+/* settings dialog (2026-10-04) */
+#settings-dialog {
+  width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+  padding: 0; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); color: var(--text);
+}
+#settings-dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+#settings-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; max-height: calc(100vh - 32px); }
+#settings-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#settings-body { overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+#settings-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+.settings-card h3 { margin: 0 0 8px; font-size: 15px; }
+.settings-field { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; font-size: 13px; }
+.settings-field.checkbox { flex-direction: row; align-items: center; gap: 6px; }
+.settings-field input[type="text"], .settings-field input[type="number"], .settings-field select {
+  padding: 4px 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); color: var(--text);
+}
+.settings-card-foot { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.settings-card-status { font-size: 12px; }
 
 /* attachments (2026-10-04) */
 .pending-atts { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }

@@ -12,9 +12,11 @@
     <button id="btn-rooms" type="button" aria-label="Show rooms">Rooms</button>
     <span id="brand">HAIKU</span>
     <span id="whoami"></span>
+    <span id="usage-readout" class="muted" aria-live="polite"></span>
     <button id="btn-people" type="button" aria-label="Show people">People</button>
     <button id="btn-md" type="button" aria-pressed="true" title="Show messages rendered as markdown, or as the raw text that was sent.">Markdown: on</button>
     <button id="btn-notify" type="button" aria-pressed="false">Notify: off</button>
+    <button id="btn-settings" type="button" hidden title="View and edit Moot Members' HAIKU settings (you only).">Settings</button>
     <button id="btn-logout" type="button">Sign out</button>
   </header>
   <div id="banner" role="status" hidden></div>
@@ -122,6 +124,19 @@
       <button type="button" id="md-back" title="Close the editor and put this text back in the quick box">Back to quick box</button>
       <button type="button" id="md-cancel">Discard</button>
       <button type="button" id="md-send">Send</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="settings-dialog" aria-labelledby="settings-title">
+  <div id="settings-form">
+    <div id="settings-head">
+      <strong id="settings-title">Moot Member settings</strong>
+      <span class="muted">Changes take effect on that member's next relaunch. Tokens are never shown here.</span>
+    </div>
+    <div id="settings-body"></div>
+    <div id="settings-foot">
+      <button type="button" id="settings-close">Close</button>
     </div>
   </div>
 </dialog>

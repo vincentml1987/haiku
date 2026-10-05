@@ -40,6 +40,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import db
+import member_settings
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -297,6 +298,56 @@ def h_set_room_wake_allowed(conn, params, body, headers, room_id, name):
     return {"ok": True, "name": unquote(name), "room_wake_allowed": body["allowed"]}
 
 
+def _require_human(conn, headers):
+    caller, token = _auth_headers(headers)
+    if db.authenticate(conn, caller, token) != "human":
+        raise db.Forbidden("only a human may view or change member settings")
+
+
+@route("GET", r"/settings")
+def h_list_settings(conn, params, body, headers):
+    _require_human(conn, headers)
+    return member_settings.list_members(Handler.settings_dir)
+
+
+@route("PUT", r"/settings/(?P<name>[^/]+)")
+def h_update_settings(conn, params, body, headers, name):
+    _require_human(conn, headers)
+    try:
+        return member_settings.update_member(Handler.settings_dir, unquote(name), body.get("changes"))
+    except member_settings.SettingsError as e:
+        raise ClientError(400, str(e))
+
+
+USAGE_DIR = Path(__file__).parent.parent / "usage-data"
+
+
+@route("GET", r"/usage")
+def h_usage(conn, params, body, headers):
+    """Newest rate-limit sample across every member's <name>.latest.json.
+    Read-only; any authenticated participant may call it."""
+    caller, token = _auth_headers(headers)
+    if not db.authenticate(conn, caller, token):
+        raise db.Forbidden("authentication required")
+    best = None
+    for f in USAGE_DIR.glob("*.latest.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("ts"), str):
+            continue
+        if best is None or data["ts"] > best["ts"]:
+            best = data
+    if best is None:
+        return {"ts": None, "five_hour": None, "seven_day": None}
+    out = {"ts": best["ts"], "five_hour": None, "seven_day": None}
+    for rl in best.get("rateLimits") or []:
+        if isinstance(rl, dict) and rl.get("kind") in ("five_hour", "seven_day"):
+            out[rl["kind"]] = {"percentUsed": rl.get("percentUsed"), "resetsAt": rl.get("resetsAt")}
+    return out
+
+
 def _host_ok(host_header: str, port: int) -> bool:
     host = (host_header or "").split(":")[0].strip("[]")
     return host in ("127.0.0.1", "localhost", "::1")
@@ -329,6 +380,7 @@ class Handler(BaseHTTPRequestHandler):
     conn = None  # set by main() before serving
     port = DEFAULT_PORT
     store_dir = default_store_dir(DEFAULT_DB_PATH)  # main() sets it from the db path
+    settings_dir = member_settings.DEFAULT_SETTINGS_DIR  # tests point this at a scratch folder
     timeout = SOCKET_TIMEOUT_S  # socketserver applies this as the request socket timeout
 
     def _respond(self, status, payload):
