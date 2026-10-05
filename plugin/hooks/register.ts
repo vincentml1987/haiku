@@ -324,12 +324,18 @@ async function eotCycle($: Engine, options: Record<string, unknown>, dryRun: boo
     if (!parseBool(options.eotCycleLive)) {
       return `EOT gate passed, but a live clear is not enabled for this identity (eotCycleLive in its settings file, which only Teddy raises). Nothing was cleared.\n${report}`
     }
-    // Both are queued until this turn ends and the session is idle, in call
-    // order, so the clear runs first and the restore prompt lands after it.
-    // Not awaited on purpose: whether this module survives /clear is the open
-    // question the first live test answers.
-    $.command.run({ command: 'clear' }).catch(() => {})
-    $.prompt.submit({ text: RESTORE_PROMPT }).catch(() => {})
+    // $.command.run rejects when called inside a hook the turn is waiting on,
+    // and this is a tool.call hook: the first live test (Tessera, 2026-10-04)
+    // swallowed that rejection and the clear never ran. So hand both calls to a
+    // timer, which runs outside the hook. They then queue until the session is
+    // idle, in call order, so the clear runs first and the restore prompt lands
+    // after it. Not awaited on purpose: whether this module survives /clear is
+    // the open question. A failure is shown as a toast, never swallowed.
+    const fail = (what: string) => (err: unknown) => $.ui.toast(`haiku_eot_cycle: ${what} failed: ${err instanceof Error ? err.message : String(err)}`)
+    $.clock.after(1000, () => {
+      $.command.run({ command: 'clear' }).catch(fail('/clear'))
+      $.prompt.submit({ text: RESTORE_PROMPT }).catch(fail('restore prompt'))
+    })
     return `LIVE: EOT gate passed for ${gate.file}.\n${report}\nQueued /clear, then the prompt "${RESTORE_PROMPT}"; both run when this turn ends.`
   }
   return `DRY RUN: EOT gate passed for ${gate.file}.\n${report}\nA live cycle would ${planText()}. Nothing was cleared.`
