@@ -72,6 +72,12 @@
       "default": "",
       "description": "Git members only: the allowed_signers file the EOT commit's signature is checked against."
     },
+    "eotCycleLive": {
+      "type": "boolean",
+      "title": "EOT live clear (ceiling)",
+      "default": false,
+      "description": "Per-identity ceiling for a live EOT > Clear > Restore cycle. Off by default; only Teddy raises it, by editing the settings file and relaunching. A session never raises its own. With it off, haiku_eot_cycle is dry-run only."
+    },
     "eotMaxAgeMinutes": {
       "type": "number",
       "title": "EOT maximum age (minutes)",

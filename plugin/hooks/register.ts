@@ -49,7 +49,7 @@ import {
   mutedRoomBreakthrough,
 } from './wake'
 import { type ReminderState, EMPTY_REMINDER_STATE, parseThresholds, decideReminder } from './reminder'
-import { type GitFacts, parseEotConfig, pickLatest, evaluateGate, formatGate, planText } from './eotcycle'
+import { type GitFacts, RESTORE_PROMPT, parseEotConfig, pickLatest, evaluateGate, formatGate, planText } from './eotcycle'
 
 /**
  * Builds the fetch closure client.ts's functions take. $.http.fetch is
@@ -318,7 +318,20 @@ async function eotCycle($: Engine, options: Record<string, unknown>, dryRun: boo
   const gate = evaluateGate(cfg, latest, git, await $.clock.now())
   const report = formatGate(gate)
   if (!gate.ok) return `EOT gate FAILED, nothing cleared.\n${report}`
-  if (!dryRun) return `EOT gate passed, but a live clear is not enabled yet (dry-run only until the submit-after-clear test is done). Nothing was cleared.\n${report}`
+  if (!dryRun) {
+    // Ceiling, set by Teddy per identity (same pattern as autoWake): no session
+    // can raise its own. Without it a live request is refused, gate or no gate.
+    if (!parseBool(options.eotCycleLive)) {
+      return `EOT gate passed, but a live clear is not enabled for this identity (eotCycleLive in its settings file, which only Teddy raises). Nothing was cleared.\n${report}`
+    }
+    // Both are queued until this turn ends and the session is idle, in call
+    // order, so the clear runs first and the restore prompt lands after it.
+    // Not awaited on purpose: whether this module survives /clear is the open
+    // question the first live test answers.
+    $.command.run({ command: 'clear' }).catch(() => {})
+    $.prompt.submit({ text: RESTORE_PROMPT }).catch(() => {})
+    return `LIVE: EOT gate passed for ${gate.file}.\n${report}\nQueued /clear, then the prompt "${RESTORE_PROMPT}"; both run when this turn ends.`
+  }
   return `DRY RUN: EOT gate passed for ${gate.file}.\n${report}\nA live cycle would ${planText()}. Nothing was cleared.`
 }
 
