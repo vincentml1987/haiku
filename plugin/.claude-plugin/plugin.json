@@ -72,6 +72,12 @@
       "default": "",
       "description": "Git members only: the allowed_signers file the EOT commit's signature is checked against."
     },
+    "usageDataDir": {
+      "type": "string",
+      "title": "Usage data folder",
+      "default": "",
+      "description": "Where this session writes its <name>.latest.json usage sample every 5 minutes (the two rate-limit windows). Empty turns the sampler off."
+    },
     "eotCycleLive": {
       "type": "boolean",
       "title": "EOT live clear (ceiling)",

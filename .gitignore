@@ -27,3 +27,4 @@ plugin/tsconfig.json
 .DS_Store
 Thumbs.db
 daemon/*.log
+usage-data/

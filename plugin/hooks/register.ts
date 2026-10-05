@@ -377,6 +377,7 @@ export const register: Register = (on, options) => {
   // Module state: dropped on reload, which is why the dedupe lives in $.store.
   let waking = false
   let poller: { cancel: () => void } | undefined
+  let usageSampler: { cancel: () => void } | undefined
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'haiku_send',
@@ -532,7 +533,28 @@ export const register: Register = (on, options) => {
         poller = $.clock.every(pollMs, () => void watchOnce())
       })
     }
-
+    
+	// Usage sampler: $.session.usage() costs nothing. Each session overwrites its
+    // own file (no append in $.fs, and no two sessions share a file), and the
+    // usage tracker's ingest dedupes the overlap on ts.
+    usageSampler?.cancel()
+    usageSampler = undefined
+    const usageDir = typeof options.usageDataDir === 'string' ? options.usageDataDir.trim() : ''
+    if (usageDir) {
+      const sampleOnce = async () => {
+        try {
+          const c = await guardedCreds($, options)
+          const u = await $.session.usage()
+          const ts = new Date(await $.clock.now()).toISOString()
+          await $.fs.write(`${usageDir}/${c.participantName}.latest.json`, JSON.stringify({ ts, rateLimits: u.rateLimits }))
+        } catch (err) {
+          $.ui.toast(`usage sample failed: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      void sampleOnce()
+      usageSampler = $.clock.every(5 * 60 * 1000, () => void sampleOnce())
+    }
+	
     try {
       await catchUp($, await guardedCreds($, options))
     } catch {
