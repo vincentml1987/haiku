@@ -159,5 +159,37 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_room_seq ON attachments(room_id, message_seq);
 
+
+-- Back-channel send proposals (2026-10-06, Teddy: "a place you can all talk,
+-- then vote on one message to me"). A proposal is made in an AI-only room
+-- (conventionally hop_limit 0 = no cap) for a message to some TARGET room;
+-- members vote, and on approval the daemon posts the exact proposed text
+-- into the target as the proposer, with every "no" and its reason attached.
+-- See daemon/proposals.py and docs/haiku-room-spec.md "Back channel".
+CREATE TABLE IF NOT EXISTS proposals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    backchannel_id  TEXT NOT NULL REFERENCES rooms(id),
+    target_room_id  TEXT NOT NULL REFERENCES rooms(id),
+    proposer        TEXT NOT NULL REFERENCES participants(name),
+    body            TEXT NOT NULL,
+    addressed_to    TEXT,
+    status          TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'sent', 'blocked', 'cancelled', 'failed')),
+    created_at      TEXT NOT NULL,
+    deadline        TEXT NOT NULL,
+    resolved_at     TEXT,
+    sent_seq        INTEGER,
+    note            TEXT
+);
+CREATE TABLE IF NOT EXISTS votes (
+    proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+    voter       TEXT NOT NULL REFERENCES participants(name),
+    vote        TEXT NOT NULL CHECK (vote IN ('yes', 'no', 'abstain')),
+    reason      TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (proposal_id, voter)
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_open ON proposals(status, target_room_id);
+
 CREATE INDEX IF NOT EXISTS idx_events_room_seq ON events(room_id, seq);
 CREATE INDEX IF NOT EXISTS idx_roster_room ON roster(room_id);

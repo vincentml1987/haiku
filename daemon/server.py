@@ -41,6 +41,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import db
 import member_settings
+import proposals
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -55,6 +56,7 @@ ROUTES = []  # (method, compiled_path_re, handler_name)
 # the JSON body reader and JSON responder; see Handler._attachment_*.
 ATTACH_READ_DEADLINE_S = 60
 SWEEP_INTERVAL_S = 3600
+PROPOSAL_SWEEP_INTERVAL_S = 5  # closes proposals whose voting window ended
 ATTACH_UPLOAD_RE = re.compile(r"^/rooms/(?P<room_id>[^/]+)/attachments$")
 ATTACH_GET_RE = re.compile(r"^/rooms/(?P<room_id>[^/]+)/attachments/(?P<att_id>[0-9a-f]{32})$")
 
@@ -234,6 +236,32 @@ def h_ack(conn, params, body, headers, room_id):
     participant, token = _auth_headers(headers)
     db.ack(conn, room_id, participant, token, body["through_seq"])
     return {"ok": True}
+
+
+@route("POST", f"/rooms/{ROOM_ID}/proposals")
+def h_propose(conn, params, body, headers, room_id):
+    proposer, token = _auth_headers(headers)
+    return proposals.propose_send(
+        conn, room_id, proposer, token, body["target_room_id"], body["body"],
+        addressed_to=body.get("addressed_to"), window_seconds=body.get("window_seconds"))
+
+
+@route("GET", f"/rooms/{ROOM_ID}/proposals")
+def h_list_proposals(conn, params, body, headers, room_id):
+    caller, token = _auth_headers(headers)
+    return proposals.list_proposals(conn, room_id, caller, token, status=params.get("status", [None])[0])
+
+
+@route("POST", r"/proposals/(?P<proposal_id>[0-9]{1,9})/vote")
+def h_vote(conn, params, body, headers, proposal_id):
+    voter, token = _auth_headers(headers)
+    return proposals.vote(conn, int(proposal_id), voter, token, body["vote"], reason=body.get("reason"))
+
+
+@route("POST", r"/proposals/(?P<proposal_id>[0-9]{1,9})/cancel")
+def h_cancel_proposal(conn, params, body, headers, proposal_id):
+    caller, token = _auth_headers(headers)
+    return proposals.cancel_proposal(conn, int(proposal_id), caller, token)
 
 
 @route("GET", r"/me/rooms")
@@ -644,9 +672,16 @@ class SweepingHTTPServer(HTTPServer):
     # hour after a reboot "now - 0 >= interval" was false and the startup
     # sweep waited an hour (Tessera's review).
     last_sweep = float("-inf")
+    last_proposal_sweep = float("-inf")
 
     def service_actions(self):
         now = time.monotonic()
+        if now - self.last_proposal_sweep >= PROPOSAL_SWEEP_INTERVAL_S:
+            self.last_proposal_sweep = now
+            try:
+                proposals.sweep_proposals(Handler.conn)
+            except Exception as e:  # noqa: BLE001 — never stop serving over a sweep
+                print(f"[haiku daemon] proposal sweep failed: {e!r}", file=sys.stderr, flush=True)
         if now - self.last_sweep >= SWEEP_INTERVAL_S:
             self.last_sweep = now
             try:

@@ -42,7 +42,7 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # with no user_version set (every db from before this system existed)
 # is treated as v1. A db whose user_version is HIGHER than this code
 # knows is refused outright rather than run against blindly.
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _migrate_v1_to_v2(conn):
@@ -117,7 +117,43 @@ def _migrate_v4_to_v5(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_room_seq ON attachments(room_id, message_seq)")
 
 
-MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5}
+PROPOSALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proposals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    backchannel_id  TEXT NOT NULL REFERENCES rooms(id),
+    target_room_id  TEXT NOT NULL REFERENCES rooms(id),
+    proposer        TEXT NOT NULL REFERENCES participants(name),
+    body            TEXT NOT NULL,
+    addressed_to    TEXT,
+    status          TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'sent', 'blocked', 'cancelled', 'failed')),
+    created_at      TEXT NOT NULL,
+    deadline        TEXT NOT NULL,
+    resolved_at     TEXT,
+    sent_seq        INTEGER,
+    note            TEXT
+);
+CREATE TABLE IF NOT EXISTS votes (
+    proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+    voter       TEXT NOT NULL REFERENCES participants(name),
+    vote        TEXT NOT NULL CHECK (vote IN ('yes', 'no', 'abstain')),
+    reason      TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (proposal_id, voter)
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_open ON proposals(status, target_room_id);
+"""
+
+
+def _migrate_v5_to_v6(conn):
+    """Adds proposals + votes (back-channel send proposals). Like v4/v5,
+    schema.sql already creates them on connect; this keeps the version
+    honest and is idempotent."""
+    conn.executescript(PROPOSALS_SCHEMA)
+
+
+MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5,
+              6: _migrate_v5_to_v6}
 
 
 def _migrate(conn, db_path, existed_before: bool):
@@ -400,6 +436,8 @@ def create_room(conn, name: str, created_by: str, token: str, topic: str | None 
                  mode: str = "closed", hop_limit: int = 6) -> str:
     authenticate(conn, created_by, token)
     _validate_display_name(name)
+    if not isinstance(hop_limit, int) or isinstance(hop_limit, bool) or hop_limit < 0:
+        raise HaikuError("hop_limit must be a whole number, 0 or more (0 = no cap)")
     if name.lower() == LOBBY_NAME:
         raise HaikuError(f"'{LOBBY_NAME}' is reserved for the daemon's own lobby room")
     room_id = str(uuid.uuid4())
@@ -629,44 +667,54 @@ def send_message(conn, room_id: str, author: str, token: str, body: str,
         _validate_addressees(conn, room_id, addressed_to)
 
     with _transaction(conn):
-        seq = _insert_event(conn, room_id, author, author_kind, "message",
-                             addressed_to=addressed_to, body=body)
-        if attachment_ids:
-            _bind_attachments(conn, room_id, author, attachment_ids, seq)
+        return _post_message(conn, room, room_id, author, author_kind, body,
+                             addressed_to, attachment_ids)
 
-        if author_kind == "human":
-            # Newest human message wins (spec §3.1/§4 simplification): clear
-            # every present AI's outstanding obligation before reassigning,
-            # so "addressed someone else" genuinely discharges the others.
-            new_hop_count = 0
-            for name in _present_ai_participants(conn, room_id):
-                _set_obligation(conn, room_id, name, None)
-            if addressed_to and addressed_to != ["all"]:
-                for name in addressed_to:
-                    if MUTE_HUMAN_ADDRESSED_BREAKS_THROUGH or not _is_muted(conn, room_id, name):
-                        _set_obligation(conn, room_id, name, seq)
-            else:
-                for name in _present_ai_participants(conn, room_id, exclude=author):
-                    if not _is_muted(conn, room_id, name):
-                        _set_obligation(conn, room_id, name, seq)
-            new_state = room["state"]
+
+def _post_message(conn, room, room_id, author, author_kind, body,
+                  addressed_to=None, attachment_ids=None) -> dict:
+    """The write half of send_message: event, obligations, hop count. Runs
+    inside the caller's transaction, after the caller has authenticated and
+    checked membership/state. Shared with proposals.py, which posts an
+    approved proposal as its chair."""
+    seq = _insert_event(conn, room_id, author, author_kind, "message",
+                         addressed_to=addressed_to, body=body)
+    if attachment_ids:
+        _bind_attachments(conn, room_id, author, attachment_ids, seq)
+
+    if author_kind == "human":
+        # Newest human message wins (spec §3.1/§4 simplification): clear
+        # every present AI's outstanding obligation before reassigning,
+        # so "addressed someone else" genuinely discharges the others.
+        new_hop_count = 0
+        for name in _present_ai_participants(conn, room_id):
+            _set_obligation(conn, room_id, name, None)
+        if addressed_to and addressed_to != ["all"]:
+            for name in addressed_to:
+                if MUTE_HUMAN_ADDRESSED_BREAKS_THROUGH or not _is_muted(conn, room_id, name):
+                    _set_obligation(conn, room_id, name, seq)
         else:
-            _set_obligation(conn, room_id, author, None)  # own message discharges own obligation
-            if addressed_to and addressed_to != ["all"]:
-                for name in addressed_to:
-                    if name != author and not _is_muted(conn, room_id, name):
-                        _set_obligation(conn, room_id, name, seq)
-            new_hop_count = room["hop_count"] + 1
-            new_state = room["state"]
-            if new_hop_count >= room["hop_limit"]:
-                new_state = "paused"
-                _insert_event(conn, room_id, author, author_kind, "pause",
-                              body=f"hop cap ({room['hop_limit']}) reached")
+            for name in _present_ai_participants(conn, room_id, exclude=author):
+                if not _is_muted(conn, room_id, name):
+                    _set_obligation(conn, room_id, name, seq)
+        new_state = room["state"]
+    else:
+        _set_obligation(conn, room_id, author, None)  # own message discharges own obligation
+        if addressed_to and addressed_to != ["all"]:
+            for name in addressed_to:
+                if name != author and not _is_muted(conn, room_id, name):
+                    _set_obligation(conn, room_id, name, seq)
+        new_hop_count = room["hop_count"] + 1
+        new_state = room["state"]
+        if room["hop_limit"] > 0 and new_hop_count >= room["hop_limit"]:  # 0 = no cap (back channels)
+            new_state = "paused"
+            _insert_event(conn, room_id, author, author_kind, "pause",
+                          body=f"hop cap ({room['hop_limit']}) reached")
 
-        conn.execute(
-            "UPDATE rooms SET hop_count = ?, state = ? WHERE id = ?",
-            (new_hop_count, new_state, room_id),
-        )
+    conn.execute(
+        "UPDATE rooms SET hop_count = ?, state = ? WHERE id = ?",
+        (new_hop_count, new_state, room_id),
+    )
 
     return {"seq": seq, "room_state": new_state}
 
@@ -694,7 +742,7 @@ def resume_room(conn, room_id: str, resumed_by: str, token: str,
     room = _get_room(conn, room_id)
     if room["state"] != "paused":
         raise HaikuError(f"room is {room['state']}, not paused")
-    new_limit = room["hop_count"] + (granted_hops or room["hop_limit"])
+    new_limit = 0 if room["hop_limit"] == 0 else room["hop_count"] + (granted_hops or room["hop_limit"])
     with _transaction(conn):
         conn.execute(
             "UPDATE rooms SET state = 'active', hop_limit = ? WHERE id = ?",

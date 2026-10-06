@@ -158,7 +158,7 @@ def main():
         check("schema version after connect() is current",
               conn.execute("PRAGMA user_version").fetchone()[0] == db.CURRENT_SCHEMA_VERSION)
 
-        for table in ("room_prefs", "attachments"):  # v4 and v5
+        for table in ("room_prefs", "attachments", "proposals", "votes"):  # v4, v5, v6
             check(f"migration creates the {table} table",
                   conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None)
 
