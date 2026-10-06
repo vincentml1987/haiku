@@ -42,7 +42,7 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # with no user_version set (every db from before this system existed)
 # is treated as v1. A db whose user_version is HIGHER than this code
 # knows is refused outright rather than run against blindly.
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def _migrate_v1_to_v2(conn):
@@ -141,6 +141,11 @@ CREATE TABLE IF NOT EXISTS votes (
     created_at  TEXT NOT NULL,
     PRIMARY KEY (proposal_id, voter)
 );
+CREATE TABLE IF NOT EXISTS proposal_voters (
+    proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+    voter       TEXT NOT NULL REFERENCES participants(name),
+    PRIMARY KEY (proposal_id, voter)
+);
 CREATE INDEX IF NOT EXISTS idx_proposals_open ON proposals(status, target_room_id);
 """
 
@@ -152,8 +157,14 @@ def _migrate_v5_to_v6(conn):
     conn.executescript(PROPOSALS_SCHEMA)
 
 
+def _migrate_v6_to_v7(conn):
+    """Adds proposal_voters (the voter set frozen when a proposal opens, so
+    a late joiner cannot swing a vote; Tessera's review). Idempotent."""
+    conn.executescript(PROPOSALS_SCHEMA)
+
+
 MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5,
-              6: _migrate_v5_to_v6}
+              6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7}
 
 
 def _migrate(conn, db_path, existed_before: bool):

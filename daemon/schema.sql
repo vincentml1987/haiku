@@ -189,6 +189,11 @@ CREATE TABLE IF NOT EXISTS votes (
     created_at  TEXT NOT NULL,
     PRIMARY KEY (proposal_id, voter)
 );
+CREATE TABLE IF NOT EXISTS proposal_voters (
+    proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+    voter       TEXT NOT NULL REFERENCES participants(name),
+    PRIMARY KEY (proposal_id, voter)
+);
 CREATE INDEX IF NOT EXISTS idx_proposals_open ON proposals(status, target_room_id);
 
 CREATE INDEX IF NOT EXISTS idx_events_room_seq ON events(room_id, seq);
