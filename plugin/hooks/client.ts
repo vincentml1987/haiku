@@ -83,6 +83,26 @@ export function setRoomMuted(fetch: HaikuFetch, roomId: string, muted: boolean) 
   return fetch('PUT', `/rooms/${roomId}/mute`, { muted })
 }
 
+/** Back-channel send proposals (2026-10-06); see daemon/proposals.py. */
+export function proposeSend(
+  fetch: HaikuFetch, backchannelId: string, targetRoomId: string, body: string,
+  opts?: { addressed_to?: string[]; window_seconds?: number },
+) {
+  return fetch('POST', `/rooms/${backchannelId}/proposals`, { target_room_id: targetRoomId, body, ...opts })
+}
+
+export function voteOnProposal(fetch: HaikuFetch, proposalId: number, vote: string, reason?: string) {
+  return fetch('POST', `/proposals/${proposalId}/vote`, reason != null ? { vote, reason } : { vote })
+}
+
+export function cancelProposal(fetch: HaikuFetch, proposalId: number) {
+  return fetch('POST', `/proposals/${proposalId}/cancel`)
+}
+
+export function listProposals(fetch: HaikuFetch, backchannelId: string, status?: string) {
+  return fetch('GET', `/rooms/${backchannelId}/proposals`, undefined, status ? { status } : undefined)
+}
+
 export function ackEvents(fetch: HaikuFetch, roomId: string, throughSeq: number) {
   return fetch('POST', `/rooms/${roomId}/ack`, { through_seq: throughSeq })
 }

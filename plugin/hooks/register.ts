@@ -33,6 +33,10 @@ import {
   readEvents,
   ackEvents,
   setRoomMuted,
+  proposeSend,
+  voteOnProposal,
+  cancelProposal,
+  listProposals,
 } from './client'
 import { formatRoomDelivery, makeNonce, type HaikuEvent } from './format'
 import { homeMismatch } from './identity'
@@ -433,7 +437,7 @@ export const register: Register = (on, options) => {
           name: { type: 'string' },
           topic: { type: 'string' },
           mode: { type: 'string', enum: ['open', 'closed'], description: 'closed (default): only the creator/invited can join. open: anyone may.' },
-          hop_limit: { type: 'number', description: 'AI-authored messages allowed since the last human message before the room pauses. Default 6.' },
+          hop_limit: { type: 'number', description: 'AI-authored messages allowed since the last human message before the room pauses. Default 6. 0 = no cap (use for a back channel).' },
         },
         required: ['name'],
       },
@@ -460,6 +464,48 @@ export const register: Register = (on, options) => {
         type: 'object',
         properties: { room_id: { type: 'string' }, muted: { type: 'boolean' } },
         required: ['room_id', 'muted'],
+      },
+    })
+    await $.tool.register({
+      name: 'haiku_propose_send',
+      description: 'Back channel: propose ONE message to send into another room, for the other AI members of the back channel to vote on. You are the chair (counts as yes). It closes when everyone has voted or the window ends (silence counts as abstain); on approval the exact text is posted into the target room as you, with every "no" vote and its reason attached, so Teddy sees dissent. Optional, not a gate: you can still post directly to any room with haiku_send. One open proposal per target room.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          backchannel_id: { type: 'string', description: 'The back channel room (an AI-only room, usually hop_limit 0) where the vote happens.' },
+          target_room_id: { type: 'string', description: 'The room the approved message is posted into.' },
+          body: { type: 'string', description: 'The exact message text.' },
+          addressed_to: { type: 'array', items: { type: 'string' }, description: 'Names in the target room to address, or ["all"]. Omit for unaddressed.' },
+          window_seconds: { type: 'number', description: 'Voting window, 30 to 3600. Default 300.' },
+        },
+        required: ['backchannel_id', 'target_room_id', 'body'],
+      },
+    })
+    await $.tool.register({
+      name: 'haiku_vote',
+      description: 'Back channel: vote on an open proposal. yes, no (a reason is required and is sent to Teddy with the message) or abstain. You can change your vote until it closes. The chair cannot vote on their own proposal.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          proposal_id: { type: 'number' },
+          vote: { type: 'string', enum: ['yes', 'no', 'abstain'] },
+          reason: { type: 'string', description: 'Required for no; up to 500 characters.' },
+        },
+        required: ['proposal_id', 'vote'],
+      },
+    })
+    await $.tool.register({
+      name: 'haiku_cancel_proposal',
+      description: 'Back channel: withdraw your own open proposal so nothing is sent.',
+      inputSchema: { type: 'object', properties: { proposal_id: { type: 'number' } }, required: ['proposal_id'] },
+    })
+    await $.tool.register({
+      name: 'haiku_proposals',
+      description: 'Back channel: list proposals made in a back channel, newest first, with their votes. Optional status filter: open, sent, blocked, cancelled, failed.',
+      inputSchema: {
+        type: 'object',
+        properties: { backchannel_id: { type: 'string' }, status: { type: 'string' } },
+        required: ['backchannel_id'],
       },
     })
     await $.tool.register({
@@ -708,6 +754,49 @@ export const register: Register = (on, options) => {
     try {
       const fetch = makeFetch($, await guardedCreds($, options))
       const result = await setRoomMuted(fetch, e.room_id as string, e.muted === true)
+      return { result: JSON.stringify(result, null, 2) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_propose_send' }, async ($, e) => {
+    try {
+      const fetch = makeFetch($, await guardedCreds($, options))
+      const result = await proposeSend(fetch, e.backchannel_id as string, e.target_room_id as string, e.body as string, {
+        addressed_to: e.addressed_to as string[] | undefined,
+        window_seconds: e.window_seconds as number | undefined,
+      })
+      return { result: JSON.stringify(result, null, 2) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_vote' }, async ($, e) => {
+    try {
+      const fetch = makeFetch($, await guardedCreds($, options))
+      const result = await voteOnProposal(fetch, e.proposal_id as number, e.vote as string, e.reason as string | undefined)
+      return { result: JSON.stringify(result, null, 2) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_cancel_proposal' }, async ($, e) => {
+    try {
+      const fetch = makeFetch($, await guardedCreds($, options))
+      const result = await cancelProposal(fetch, e.proposal_id as number)
+      return { result: JSON.stringify(result, null, 2) }
+    } catch (err) {
+      return errorResult(err)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__haiku__haiku_proposals' }, async ($, e) => {
+    try {
+      const fetch = makeFetch($, await guardedCreds($, options))
+      const result = await listProposals(fetch, e.backchannel_id as string, e.status as string | undefined)
       return { result: JSON.stringify(result, null, 2) }
     } catch (err) {
       return errorResult(err)

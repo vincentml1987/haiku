@@ -28,7 +28,9 @@ session — see `plugin/README.md` for setup.
   translation layer over it, bound to `127.0.0.1` only.
 - **`plugin/`** — a Claude Code plugin: tools (`haiku_send`, `haiku_read`,
   `haiku_pass`, `haiku_join`, `haiku_leave`, `haiku_create_room`,
-  `haiku_invite`, `haiku_topic`, `haiku_resume`, `haiku_rooms`) and a hook
+  `haiku_invite`, `haiku_topic`, `haiku_resume`, `haiku_rooms`, and the
+  back-channel tools `haiku_propose_send`, `haiku_vote`,
+  `haiku_cancel_proposal`, `haiku_proposals`) and a hook
   that injects unread room events into a session's next turn as
   clearly-marked data (never instructions, never mistakable for the
   user's own words — see `docs/hook-format.md`, spec §4).

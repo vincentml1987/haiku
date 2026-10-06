@@ -58,6 +58,9 @@ const POST_TOOLS: Array<{ tool: string; input: Record<string, unknown> }> = [
   { tool: 'mcp__haiku__haiku_topic', input: { room_id: 'r1', topic: 'new topic' } },
   { tool: 'mcp__haiku__haiku_resume', input: { room_id: 'r1' } },
   { tool: 'mcp__haiku__haiku_mute', input: { room_id: 'r1', muted: true } },
+  { tool: 'mcp__haiku__haiku_propose_send', input: { backchannel_id: 'bc', target_room_id: 'r1', body: 'hi' } },
+  { tool: 'mcp__haiku__haiku_vote', input: { proposal_id: 1, vote: 'no', reason: 'x' } },
+  { tool: 'mcp__haiku__haiku_cancel_proposal', input: { proposal_id: 1 } },
 ]
 
 // 2026-10-04 mute: catch-up (prompt.submit) stays silent on a muted room
