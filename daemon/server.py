@@ -409,7 +409,7 @@ def h_tasks(conn, params, body, headers):
 
 def _host_ok(host_header: str, port: int) -> bool:
     host = (host_header or "").split(":")[0].strip("[]")
-    return host in ("127.0.0.1", "localhost", "::1")
+    return host in ("127.0.0.1", "localhost", "::1", "fenra.tail376ef6.ts.net")
 
 
 UI_DIR = Path(__file__).parent / "ui"
